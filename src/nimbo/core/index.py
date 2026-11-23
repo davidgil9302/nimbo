@@ -92,6 +92,9 @@ _DELETE_REMOTE_SUBTREE = """
             SELECT ?
             UNION
             SELECT remote.id FROM remote JOIN subtree ON remote.parent_id = subtree.id
+            -- Never recurse into the target root: deleting some other subtree must not be able
+            -- to take the mirror's root (and everything below it) with it.
+            WHERE remote.id NOT IN (SELECT value FROM meta WHERE key = 'target_root_id')
         )
         SELECT id FROM subtree
     )

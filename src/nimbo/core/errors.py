@@ -12,10 +12,10 @@ class NimboError(Exception):
     code: str = "error"
 
     def __init__(self, detail: str = "", *, code: str | None = None) -> None:
-        super().__init__(detail or self.code)
-        self.detail = detail
         if code is not None:
             self.code = code
+        super().__init__(detail or self.code)
+        self.detail = detail
 
 
 class ConfigError(NimboError):

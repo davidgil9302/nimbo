@@ -654,3 +654,32 @@ def test_integrity_ok(db: Index) -> None:
         (STARTED,),
     )
     assert not db.integrity_ok()
+
+
+def test_delete_subtree_never_reaches_target_root(tmp_path: Path) -> None:
+    """Defense in depth: if the root was re-parented under a deleted folder, it must survive."""
+    from nimbo.core.index import META_TARGET_ID, Index
+    from nimbo.core.model import FOLDER_MIME, RemoteFile
+
+    index = Index(tmp_path / "nimbo.db")
+    index.set_meta(META_TARGET_ID, "root")
+    index.upsert_remote(
+        [
+            RemoteFile(id="outside", name="Outside", mime_type=FOLDER_MIME, parents=("elsewhere",)),
+            RemoteFile(id="root", name="FILES", mime_type=FOLDER_MIME, parents=("outside",)),
+            RemoteFile(id="doc", name="a.txt", mime_type="text/plain", parents=("root",), size=1),
+        ]
+    )
+    index.delete_remote(["outside"])
+    assert index.get_remote("outside") is None
+    assert index.get_remote("root") is not None
+    assert index.get_remote("doc") is not None
+    index.close()
+
+
+def test_error_code_used_as_message_when_no_detail() -> None:
+    from nimbo.core.errors import NimboError
+
+    error = NimboError(code="custom_code")
+    assert error.code == "custom_code"
+    assert str(error) == "custom_code"
