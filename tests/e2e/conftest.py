@@ -89,7 +89,8 @@ def drive_sandbox() -> Iterator[_Sandbox]:
 
     hooks = context.TestHooks()
     with context.new_http_client() as http:
-        tokens = context.token_provider(config.oauth, context.secret_store(hooks), http, hooks)
+        store = context.secret_store(hooks, Paths.default().config_dir)
+        tokens = context.token_provider(config.oauth, store, http, hooks)
         drive = context.make_drive(http, tokens, TransferConfig(), hooks)
         sandbox = _Sandbox(drive, config, folder_id)
         sandbox.check_parent(folder_id)

@@ -353,6 +353,16 @@ def test_trash_confirmation_defaults_to_no(setup, monkeypatch, capsys, answer, e
     assert queued == ([paths] if expected == 0 else [])
 
 
+def _profile_store(paths, store):
+    """Return a secret_store replacement that checks the caller names this profile."""
+
+    def secret_store(hooks, config_dir):
+        assert config_dir == paths.config_dir
+        return store
+
+    return secret_store
+
+
 def test_uninstall_purges_only_owned_files_after_confirmation(setup, tmp_path, monkeypatch):
     paths, _, _ = setup
     root = tmp_path / "source"
@@ -365,7 +375,7 @@ def test_uninstall_purges_only_owned_files_after_confirmation(setup, tmp_path, m
     monkeypatch.setattr(cli.service, "units_dir", lambda: tmp_path / "units")
     secrets = MemorySecretStore()
     secrets.set(REFRESH_TOKEN_KEY, "test-refresh-value", label="unit")
-    monkeypatch.setattr(context, "secret_store", lambda _: secrets)
+    monkeypatch.setattr(context, "secret_store", _profile_store(paths, secrets))
     assert cli.main(["uninstall", "--purge"]) == 0
     assert paths.db_file.exists() and secrets.get(REFRESH_TOKEN_KEY)
     assert cli.main(["uninstall", "--purge", "--yes"]) == 0
@@ -386,7 +396,7 @@ def test_uninstall_can_revoke_before_purging(setup, tmp_path, monkeypatch):
 
     monkeypatch.setenv("NIMBO_API_BASE", "http://localhost:18080")
     monkeypatch.setenv("NIMBO_OAUTH_BASE", "http://localhost:18081")
-    monkeypatch.setattr(context, "secret_store", lambda _: secrets)
+    monkeypatch.setattr(context, "secret_store", _profile_store(paths, secrets))
     monkeypatch.setattr(cli.wizard.auth, "revoke", revoke)
     monkeypatch.setattr(cli.service, "units_dir", lambda: tmp_path / "units")
     assert cli.main(["uninstall", "--purge", "--yes", "--revoke"]) == 0
@@ -486,7 +496,11 @@ def test_systemd_install_doctor_and_uninstall_use_default_xdg(tmp_path, monkeypa
 
     monkeypatch.delenv("NIMBO_OAUTH_BASE", raising=False)
     monkeypatch.setattr(
-        context, "secret_store", lambda hooks: secrets if hooks.api_base is None else None
+        context,
+        "secret_store",
+        lambda hooks, config_dir: (
+            secrets if hooks.api_base is None and config_dir == paths.config_dir else None
+        ),
     )
     monkeypatch.setattr(context, "new_http_client", lambda **kw: fake.client())
     monkeypatch.setattr(cli.wizard.auth, "authorize_interactive", authorize)
@@ -659,7 +673,7 @@ def test_client_json_oauth_error_does_not_expose_secret(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(context, "secret_store", lambda _: MemorySecretStore())
+    monkeypatch.setattr(context, "secret_store", lambda _hooks, _config_dir: MemorySecretStore())
     monkeypatch.delenv("NIMBO_OAUTH_BASE", raising=False)
 
     def authorization_error(oauth, http):
@@ -796,7 +810,7 @@ def test_partial_backup_prints_scan_warnings(capsys):
 def test_diagnostico_can_explain_damaged_run(setup, capsys, monkeypatch):
     with sqlite3.connect(setup[0].db_file) as db:
         db.execute("UPDATE run SET summary = ?", ('{"run_id":1}',))
-    monkeypatch.setattr(cli.doctor, "_cloud_checks", lambda cfg: iter(()))
+    monkeypatch.setattr(cli.doctor, "_cloud_checks", lambda paths, cfg: iter(()))
     monkeypatch.setattr(
         cli.service, "service_state", lambda: ServiceState(False, False, False, None)
     )

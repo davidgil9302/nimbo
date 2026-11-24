@@ -46,9 +46,9 @@ def _check(
     ), values
 
 
-def _cloud_checks(cfg: Config | None) -> Iterator[tuple[Check, dict[str, str]]]:
+def _cloud_checks(paths: Paths, cfg: Config | None) -> Iterator[tuple[Check, dict[str, str]]]:
     hooks = context.test_hooks(os.environ)
-    store = context.secret_store(hooks)
+    store = context.secret_store(hooks, paths.config_dir)
     try:
         store.get(REFRESH_TOKEN_KEY)
         yield _check("keyring", True)
@@ -97,7 +97,7 @@ def _checks(paths: Paths, *, language: str) -> Iterator[tuple[Check, dict[str, s
     except ConfigError:
         cfg = None
     yield _check("config", cfg is not None)
-    yield from _cloud_checks(cfg)
+    yield from _cloud_checks(paths, cfg)
 
     root_uuid = None
     last = None

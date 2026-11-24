@@ -14,6 +14,8 @@ import secretstorage
 from nimbo.core.errors import SecretStoreError
 from nimbo.core.secrets import MemorySecretStore, SecretServiceStore
 
+PROFILE = "0123456789abcdef0123456789abcdef"
+
 
 @dataclass
 class _Item:
@@ -29,6 +31,12 @@ class _Item:
 
     def get_created(self) -> int:
         return self.created
+
+    def get_label(self) -> str:
+        return self.label
+
+    def get_attributes(self) -> dict[str, str]:
+        return dict(self.attributes)
 
     def delete(self) -> None:
         self.collection.items.remove(self)
@@ -92,7 +100,7 @@ def keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[SecretServiceStor
         return collection
 
     monkeypatch.setattr(secretstorage, "get_default_collection", default)
-    yield SecretServiceStore(connect=connect), collection
+    yield SecretServiceStore(profile=PROFILE, connect=connect), collection
     assert all(bus.closed for bus in connections)
 
 
@@ -115,8 +123,9 @@ def test_secret_service_store_with_fake_backend(
 ) -> None:
     """Select the newest secret, replace duplicates, and preserve unrelated items."""
     store, collection = keyring
-    attributes = {"application": "nimbo", "key": "key"}
+    attributes = {"application": "nimbo", "key": "key", "profile": PROFILE}
     unrelated = collection.create_item("Other", {**attributes, "application": "other"}, b"other")
+    other_profile = collection.create_item("Profile", {**attributes, "profile": "x"}, b"x")
     assert store.get("key") is None
     collection.create_item("Old", attributes, b"old")
     collection.create_item("New", {**attributes, "extra": "value"}, "más reciente".encode())
@@ -132,7 +141,7 @@ def test_secret_service_store_with_fake_backend(
     store.delete("key")
     store.delete("key")
     assert store.get("key") is None
-    assert collection.items == [unrelated]
+    assert collection.items == [unrelated, other_profile]
 
 
 def test_locked_collection_unlock_success(keyring: tuple[SecretServiceStore, _Collection]) -> None:
@@ -162,7 +171,7 @@ def test_dbus_unavailable_raises() -> None:
     def connect() -> _Bus:
         raise secretstorage.SecretServiceNotAvailableException("sentinel-secret")
 
-    store = SecretServiceStore(connect=connect)
+    store = SecretServiceStore(profile=PROFILE, connect=connect)
     with pytest.raises(SecretStoreError) as caught:
         store.get("key")
     assert caught.value.code == "secret_store_unavailable"
@@ -191,7 +200,7 @@ def test_failed_replacement_preserves_existing_secret(
 )
 def test_real_secret_service_roundtrip() -> None:
     """Round-trip a dedicated disposable key in the real default collection."""
-    store = SecretServiceStore()
+    store = SecretServiceStore(profile=f"test-{uuid4().hex}")
     key = f"test-{uuid4().hex}"
     try:
         assert store.get(key) is None

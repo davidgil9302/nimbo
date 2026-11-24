@@ -295,10 +295,12 @@ def _service_executable() -> Path:
 
 def _launcher(paths: Paths, binary: Path) -> Path:
     launcher = paths.config_dir / _LAUNCHER
+    # Plain exports keep a binary path containing "=" from turning into an env assignment.
     command = (
-        f"#!/bin/sh\nexec env NIMBO_CONFIG_DIR={shlex.quote(str(paths.config_dir.absolute()))} "
-        f"NIMBO_STATE_DIR={shlex.quote(str(paths.state_dir.absolute()))} "
-        f'{shlex.quote(str(binary))} "$@"\n'
+        "#!/bin/sh\n"
+        f"export NIMBO_CONFIG_DIR={shlex.quote(str(paths.config_dir.absolute()))}\n"
+        f"export NIMBO_STATE_DIR={shlex.quote(str(paths.state_dir.absolute()))}\n"
+        f'exec {shlex.quote(str(binary))} "$@"\n'
     )
     atomic_write_text(launcher, command, mode=0o700)
     return launcher
@@ -374,6 +376,19 @@ def _store_refresh(store: SecretStore, refresh: str | None) -> Iterator[None]:
         raise
 
 
+def _recorded_account(paths: Paths) -> str | None:
+    """Return the Google account the journal records for this mirror, if any."""
+    if not paths.db_file.is_file():
+        return None
+    with closing(Index.open_readonly(paths.db_file)) as index:
+        return index.get_meta(META_ACCOUNT)
+
+
+def _confirm_account(t: Translator, console: Console, account: str | None) -> bool:
+    name = safe_label(account or t("common.unknown"))
+    return confirm(t, console, t("wizard.confirm_account", name=name))
+
+
 def _setup_complete(paths: Paths, cfg: Config) -> bool:
     if not paths.db_file.is_file():
         return False
@@ -412,7 +427,10 @@ def _save_setup(
         changed_mirror = root_uuid != recorded_root or cfg.target.folder_id != index.get_meta(
             META_TARGET_ID
         )
-        changed_account = previous is not None and cfg.oauth != previous.oauth
+        recorded_account = index.get_meta(META_ACCOUNT)
+        changed_account = (previous is not None and cfg.oauth != previous.oauth) or (
+            recorded_account is not None and recorded_account != account
+        )
         reset = changed_mirror or changed_account
         if reset and index.inflight_ops():
             raise NimboError(code="wizard.unfinished_run")
@@ -512,7 +530,7 @@ def install(
         raise NimboError(code="source_not_mounted")
 
     hooks = context.test_hooks(os.environ)
-    store = context.secret_store(hooks)
+    store = context.secret_store(hooks, paths.config_dir)
     store.get(REFRESH_TOKEN_KEY)
     console.print(Text(t("wizard.requirements", version=".".join(map(str, sys.version_info[:3])))))
     if not shutil.which("notify-send"):
@@ -530,6 +548,10 @@ def install(
         if item is None or item.trashed or not item.is_folder:
             raise NimboError(code="target_missing")
         console.print(Text(t("wizard.target_ok", name=safe_label(item.name))))
+    # A new grant is stored only after the person confirms the account that answered.
+    if refresh is not None and not options.unattended and not _confirm_account(t, console, account):
+        console.print(Text(t("wizard.kept")))
+        return 1
     if previous is None or previous.target.folder_id != target_id:
         cfg = replace(cfg, target=TargetConfig(target_id, item.name))
     _save_setup(paths, cfg, previous, store, refresh, account)
@@ -541,6 +563,14 @@ def install(
     return 0
 
 
+def _require_recorded_account(paths: Paths, account: str | None) -> None:
+    # Reconnect renews access for the mirror's account. Switching accounts goes through
+    # install, which resets the journal for the new account.
+    recorded = _recorded_account(paths)
+    if recorded is not None and account != recorded:
+        raise NimboError(code="wizard.account_mismatch")
+
+
 def reconnect(
     paths: Paths, cfg: Config, options: ClientOptions, *, t: Translator, console: Console
 ) -> int:
@@ -548,7 +578,7 @@ def reconnect(
     oauth = _resolve_client(options, t, console, unattended=True) if options.provided else cfg.oauth
     updated = replace(cfg, oauth=oauth)
     hooks = context.test_hooks(os.environ)
-    store = context.secret_store(hooks)
+    store = context.secret_store(hooks, paths.config_dir)
     store.get(REFRESH_TOKEN_KEY)
     context.validate_state_paths(paths)
     with context.new_http_client(loopback=hooks.api_base is not None) as http:
@@ -556,9 +586,16 @@ def reconnect(
             oauth, cfg.transfer, http, hooks, store, t, console, authorize=True
         )
         account = drive.about().email
+    _require_recorded_account(paths, account)
+    if refresh is not None and sys.stdin.isatty():
+        console.print(Text(t("wizard.account", name=safe_label(account or t("common.unknown")))))
+        if not _confirm_account(t, console, account):
+            console.print(Text(t("wizard.kept")))
+            return 1
     with RunLock(paths.lock_file):
         if _existing_config(paths) != cfg:
             raise NimboError(code="wizard.setup_changed")
+        _require_recorded_account(paths, account)
         with _store_refresh(store, refresh):
             if updated != cfg:
                 save_config(updated, paths.config_file)
@@ -592,7 +629,7 @@ def uninstall(
     if purge:
         with RunLock(paths.lock_file):
             hooks = context.test_hooks(os.environ)
-            store = context.secret_store(hooks)
+            store = context.secret_store(hooks, paths.config_dir)
             token = store.get(REFRESH_TOKEN_KEY)
             if token and (
                 revoke or (sys.stdin.isatty() and confirm(t, console, t("wizard.revoke")))

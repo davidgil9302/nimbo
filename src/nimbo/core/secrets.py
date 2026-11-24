@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol
 
@@ -13,6 +15,17 @@ from jeepney.wrappers import DBusErrorResponse
 from .errors import SecretStoreError
 
 REFRESH_TOKEN_KEY = "refresh_token"  # noqa: S105 - Secret Service lookup key
+_PROFILE = "profile"
+
+
+def profile_id(config_dir: Path) -> str:
+    """Return the keyring profile for a configuration directory.
+
+    Each NIMBO_CONFIG_DIR is a separate installation, so its credential lives in
+    a separate Secret Service item identified by a hash of the resolved path.
+    """
+    resolved = str(config_dir.expanduser().resolve())
+    return hashlib.sha256(resolved.encode("utf-8", "surrogateescape")).hexdigest()[:32]
 
 
 class SecretStore(Protocol):
@@ -51,19 +64,28 @@ class MemorySecretStore:
             self._values.pop(key, None)
 
 
-def _attributes(key: str) -> dict[str, str]:
-    return {"application": "nimbo", "key": key}
+def _attributes(key: str, profile: str | None = None) -> dict[str, str]:
+    attributes = {"application": "nimbo", "key": key}
+    if profile is not None:
+        attributes[_PROFILE] = profile
+    return attributes
 
 
 class SecretServiceStore:
-    """Store UTF-8 secrets in the default Secret Service collection via D-Bus.
+    """Store UTF-8 secrets for one profile in the default Secret Service collection.
 
-    The optional connect factory supplies a fresh SecretStorage-compatible
-    D-Bus connection per operation. Operations raise SecretStoreError when the
-    collection cannot be unlocked or the backend cannot complete the request.
+    Items carry the profile attribute (see profile_id), and every lookup,
+    replacement and deletion names it, so installations never read, replace or
+    delete each other's credentials. The optional connect factory supplies a
+    fresh SecretStorage-compatible D-Bus connection per operation. Operations
+    raise SecretStoreError when the collection cannot be unlocked or the backend
+    cannot complete the request.
     """
 
-    def __init__(self, *, connect: Callable[[], Any] | None = None) -> None:
+    def __init__(self, *, profile: str, connect: Callable[[], Any] | None = None) -> None:
+        if not profile:
+            raise ValueError("A keyring profile is required")
+        self._profile = profile
         self._connect = connect if connect is not None else secretstorage.dbus_init
         self._lock = Lock()
 
@@ -93,18 +115,38 @@ class SecretServiceStore:
         raise SecretStoreError(code=code)
 
     def get(self, key: str) -> str | None:
-        """Return the newest matching item's UTF-8 value, or None if absent."""
+        """Return the profile's newest UTF-8 value, adopting a lone legacy item if absent.
+
+        Items written before profiles existed carry no profile attribute. When
+        the profile has no item and exactly one such legacy item exists, it is
+        copied into the profile's item and the legacy item is deleted. With
+        several legacy items the owner is ambiguous, so none is adopted.
+        """
+        attributes = _attributes(key, self._profile)
         with self._collection() as collection:
             newest = max(
-                collection.search_items(_attributes(key)),
+                collection.search_items(attributes),
                 key=lambda item: item.get_created(),
                 default=None,
             )
-            return newest.get_secret().decode("utf-8") if newest is not None else None
+            if newest is not None:
+                return newest.get_secret().decode("utf-8")
+            legacy = [
+                item
+                for item in collection.search_items(_attributes(key))
+                if _PROFILE not in item.get_attributes()
+            ]
+            if len(legacy) != 1:
+                return None
+            (item,) = legacy
+            secret = item.get_secret()
+            collection.create_item(item.get_label(), attributes, secret, replace=True)
+            self._delete_item(item)
+            return secret.decode("utf-8")
 
     def set(self, key: str, value: str, *, label: str) -> None:
-        """Write the replacement, then remove any remaining items for the same key."""
-        attributes = _attributes(key)
+        """Write the replacement, then remove the profile's other items for the key."""
+        attributes = _attributes(key, self._profile)
         with self._collection() as collection:
             previous = list(collection.search_items(attributes))
             current = collection.create_item(label, attributes, value.encode("utf-8"), replace=True)
@@ -113,9 +155,9 @@ class SecretServiceStore:
                     self._delete_item(item)
 
     def delete(self, key: str) -> None:
-        """Delete every matching item in the default collection."""
+        """Delete every item of this profile for the key in the default collection."""
         with self._collection() as collection:
-            for item in list(collection.search_items(_attributes(key))):
+            for item in list(collection.search_items(_attributes(key, self._profile))):
                 self._delete_item(item)
 
     @staticmethod

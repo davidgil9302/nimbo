@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
@@ -21,7 +22,7 @@ from nimbo.core.index import Index
 from nimbo.core.paths import Paths
 from nimbo.core.ratelimit import RateLimiter, RetryPolicy
 from nimbo.core.safety import network_available
-from nimbo.core.secrets import MemorySecretStore, SecretServiceStore, SecretStore
+from nimbo.core.secrets import MemorySecretStore, SecretServiceStore, SecretStore, profile_id
 from nimbo.core.transfer import Downloader, Uploader
 
 from . import service
@@ -73,9 +74,16 @@ def new_http_client(*, loopback: bool = False) -> httpx.Client:
     )
 
 
-def secret_store(hooks: TestHooks) -> SecretStore:
-    """Select in-memory storage in hook mode and the desktop keyring otherwise."""
-    return MemorySecretStore() if hooks.api_base is not None else SecretServiceStore()
+def secret_store(hooks: TestHooks, config_dir: Path | None = None) -> SecretStore:
+    """Select in-memory storage in hook mode and the profile's keyring item otherwise.
+
+    The profile is the configuration directory, which defaults to the one the
+    environment selects. Callers that already hold their Paths pass its config_dir.
+    """
+    if hooks.api_base is not None:
+        return MemorySecretStore()
+    directory = Paths.default().config_dir if config_dir is None else config_dir
+    return SecretServiceStore(profile=profile_id(directory))
 
 
 def token_provider(
@@ -157,7 +165,10 @@ def build_engine(
         index = Index(paths.db_file)
         stack.callback(index.close)
         drive = make_drive(
-            http, token_provider(cfg.oauth, secret_store(hooks), http, hooks), cfg.transfer, hooks
+            http,
+            token_provider(cfg.oauth, secret_store(hooks, paths.config_dir), http, hooks),
+            cfg.transfer,
+            hooks,
         )
         engine = Engine(
             EngineDeps(

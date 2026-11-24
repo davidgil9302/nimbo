@@ -116,6 +116,18 @@ def _register(fake: FakeDrive) -> None:
     fake.oauth.register_client(CLIENT.client_id, CLIENT.client_secret)
 
 
+def _start(browser: httpx.Client, url: str) -> str:
+    """Open the loopback start URL like a browser and return the consent URL it redirects to."""
+    start = httpx.URL(url)
+    assert (start.scheme, start.host) == ("http", "127.0.0.1") and start.port
+    assert start.path.startswith("/start/") and not start.query
+    response = browser.get(url)
+    assert response.status_code == 302
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    return response.headers["location"]
+
+
 def _authorize(fake: FakeDrive, url: str) -> tuple[str, str, str]:
     params = httpx.URL(url).params
     code = fake.oauth.authorize(
@@ -156,8 +168,11 @@ def test_authorize_interactive_happy_path(browser_http: httpx.Client) -> None:
     published: list[str] = []
     pages: Queue[httpx.Response] = Queue()
 
+    consent: list[str] = []
+
     def open_browser(url: str) -> bool:
-        redirect, state, code = _authorize(fake, url)
+        consent.append(_start(browser_http, url))
+        redirect, state, code = _authorize(fake, consent[-1])
         pages.put(browser_http.get(redirect, params={"code": code, "state": state}))
         return True
 
@@ -180,7 +195,10 @@ def test_authorize_interactive_happy_path(browser_http: httpx.Client) -> None:
     assert "close this tab" in page.text and "cerrar esta pestaña" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
-    (url,) = published
+    # Only the single-use loopback start URL is published; the consent URL never is.
+    (start,) = published
+    assert httpx.URL(start).host == "127.0.0.1" and httpx.URL(start).path.startswith("/start/")
+    (url,) = consent
     params = httpx.URL(url).params
     assert str(httpx.URL(url).copy_with(query=None)) == AUTH_URL
     assert dict(params) == {
@@ -226,8 +244,9 @@ def test_state_mismatch_ignored_then_correct_callback_accepted(
             open_browser=open_browser,
             timeout_s=5,
         )
-        redirect, state, code = _authorize(fake, published.get(timeout=2))
+        start = published.get(timeout=2)
         assert browser_called.wait(timeout=2)
+        redirect, state, code = _authorize(fake, _start(browser_http, start))
         good = {"code": code, "state": state}
         assert browser_http.get(redirect + "favicon.ico", params=good).status_code == 404
         assert browser_http.get(redirect + "/", params=good).status_code == 404
@@ -250,7 +269,7 @@ def test_access_denied(browser_http: httpx.Client) -> None:
     pages: Queue[httpx.Response] = Queue()
 
     def denied(url: str) -> bool:
-        params = httpx.URL(url).params
+        params = httpx.URL(_start(browser_http, url)).params
         pages.put(
             browser_http.get(
                 params["redirect_uri"],
@@ -324,7 +343,7 @@ def test_missing_refresh_token_or_scope(browser_http: httpx.Client, missing: str
         del payload[missing]
 
     def browser(url: str) -> bool:
-        params = httpx.URL(url).params
+        params = httpx.URL(_start(browser_http, url)).params
         browser_http.get(params["redirect_uri"], params={"state": params["state"], "code": "test"})
         return True
 
