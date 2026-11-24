@@ -7,7 +7,7 @@ import os
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -48,6 +48,7 @@ from .model import (
     RemoteFile,
     RunResult,
     RunSummary,
+    ScanProblem,
     ScanResult,
     UndoSummary,
     nfc,
@@ -98,6 +99,13 @@ class EngineDeps:
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
     network_check: Callable[[], bool] = network_available
     idle_inhibitor: Callable[[], AbstractContextManager[None]] = nullcontext
+
+
+@dataclass(slots=True)
+class ScanAuditReport(AuditReport):
+    """Report mirror differences and local paths that could not be audited."""
+
+    scan_problems: list[ScanProblem] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -223,7 +231,9 @@ class Engine:
             summary.run_id = run_id
             progress = ProgressTracker(deps.paths.progress_file, run_id)
             _phase(progress, "preflight")
-            prepared = self._prepare(stop, run_id, progress, force_deep=summary.trigger == "verify")
+            prepared = self._prepare(
+                stop, summary, progress, force_deep=summary.trigger == "verify"
+            )
             self._execute(prepared, run_id, summary, allow_brakes, stop, progress)
         except _PreflightError as exc:
             summary.result, summary.reason, summary.detail = exc.result, exc.code, exc.detail
@@ -275,11 +285,11 @@ class Engine:
             raise _PreflightError("sentinel_mismatch")
         if not previous:
             deps.index.set_meta(META_ROOT_UUID, root_uuid)
-        ignored = set()
+        ignored = {"folder_unreadable"}
         if restoring:
-            ignored = {"folder_missing", "folder_empty", "folder_unreadable"}
+            ignored.update(("folder_missing", "folder_empty"))
         elif auditing:
-            ignored = {"folder_empty"}
+            ignored.add("folder_empty")
         for problem in check_source(deps.cfg, root_uuid):
             if problem.code not in ignored:
                 raise _PreflightError(problem.code, problem.detail)
@@ -324,7 +334,7 @@ class Engine:
                     # intents until a backup can journal their reconciled outcome.
                     if run_id is None:
                         continue
-                    if item is None or item.trashed:
+                    if item is not None and item.trashed:
                         before = deps.index.get_remote(op_id)
                         deps.index.complete_op(
                             op,
@@ -332,6 +342,11 @@ class Engine:
                             trash_log_run=run_id,
                             trashed_is_folder=before is not None and before.is_folder,
                         )
+                        continue
+                    if item is None:
+                        # Gone for good (or no longer reachable): undo could not
+                        # restore it, so complete the intent without an undo entry.
+                        deps.index.complete_op(op, remove_subtrees=[op_id])
                         continue
                 elif item is None or item.trashed:
                     deps.index.delete_remote([op_id])
@@ -355,7 +370,7 @@ class Engine:
     def _prepare(
         self,
         stop: Event,
-        run_id: int | None = None,
+        summary: RunSummary | None = None,
         progress: ProgressTracker | None = None,
         *,
         force_deep: bool = False,
@@ -376,7 +391,7 @@ class Engine:
         index.set_meta(META_QUOTA_USED, str(about.usage))
         self._reset_target()
         _phase(progress, "listing")
-        self._reconcile(run_id, stop)
+        self._reconcile(summary.run_id if summary is not None else None, stop)
         indexer = self._indexer(stop)
         try:
             indexer.refresh()
@@ -388,13 +403,23 @@ class Engine:
         _phase(progress, "scanning")
         matcher = cfg.matcher()
         scanned = scan(cfg.source.root, cfg.active_folders, matcher, should_stop=stop.is_set)
+        if summary is not None:
+            summary.warnings.extend(
+                PlanIssue(
+                    problem.code,
+                    problem.rel.encode("utf-8", "backslashreplace").decode("utf-8"),
+                    problem.detail,
+                )
+                for problem in scanned.problems
+            )
         if scanned.missing_folders:
             raise _PreflightError("folder_missing", scanned.missing_folders[0])
         if scanned.empty_folders:
             # Recheck physical emptiness after scanning to catch a mount or input
             # lost since preflight. A directory containing only exclusions can be valid.
             for problem in check_source(cfg, root_uuid):
-                raise _PreflightError(problem.code, problem.detail)
+                if problem.code != "folder_unreadable" or problem.detail not in scanned.protected:
+                    raise _PreflightError(problem.code, problem.detail)
 
         _check_stop(stop)
         _phase(progress, "planning")
@@ -433,7 +458,7 @@ class Engine:
     ) -> None:
         deps = self._deps
         plan = prepared.plan
-        summary.warnings = plan.warnings
+        summary.warnings.extend(plan.warnings)
         if plan.errors:
             problem = plan.errors[0]
             raise _PreflightError(
@@ -477,6 +502,8 @@ class Engine:
             report = executor.execute(run_id, plan.ops)
 
         self._record_report(summary, report)
+        if prepared.scanned.problems and summary.result in (RunResult.OK, RunResult.PARTIAL):
+            summary.result, summary.reason = RunResult.PARTIAL, "scan_incomplete"
         now = deps.clock()
         summary.finished_at = now.isoformat()
         self._folder_stats(prepared, summary.finished_at, summary)
@@ -507,6 +534,7 @@ class Engine:
 
     @staticmethod
     def _record_report(summary: RunSummary, report: ExecReport) -> None:
+        summary.warnings.extend(report.warnings)
         summary.mkdirs = report.done[OpKind.MKDIR]
         summary.uploaded = report.done[OpKind.UPLOAD]
         summary.uploaded_bytes = report.uploaded_bytes
@@ -541,7 +569,7 @@ class Engine:
         planned = prepared.plan.stats
         pending_files = Counter(planned.per_folder_pending_files)
         pending_bytes = Counter(planned.per_folder_pending_bytes)
-        failed_folders = set()
+        failed_folders = {rel_top(problem.rel) for problem in prepared.scanned.problems}
         if summary is not None and summary.run_id is not None:
             for op, state, _ in index.op_states(summary.run_id):
                 folder = rel_top(op.rel)
@@ -698,25 +726,26 @@ class Engine:
                 if item.owner_root not in (None, root_uuid):
                     raise NimboError(code="foreign-owner")
                 with _restore_parent(root_fd, rel) as (parent_fd, name):
-                    # Downloader needs a Path for exclusive staging and publish.
-                    # The fd-backed path keeps both operations in the checked directory.
-                    dest = Path(f"/proc/self/fd/{parent_fd}") / name
-                    if os.path.lexists(dest):
-                        summary.skipped_existing.append(rel)
-                        continue
-                    try:
-                        if item.is_folder:
+                    if item.is_folder:
+                        try:
                             os.mkdir(name, dir_fd=parent_fd)
+                        except FileExistsError:
+                            # Reuse only an actual directory, never a symlink or file.
+                            os.close(os.open(name, _DIR_FLAGS, dir_fd=parent_fd))
                         else:
+                            folders.append((rel, item.modified_ms))
+                    else:
+                        # Pin the directory used for exclusive download staging and publish.
+                        dest = Path(f"/proc/self/fd/{parent_fd}") / name
+                        try:
                             deps.downloader.download(item, dest, on_bytes=check_download_stop)
+                        except FileExistsError:
+                            if not os.path.lexists(dest):
+                                raise
+                            summary.skipped_existing.append(rel)
+                        else:
                             summary.restored_files += 1
-                    except FileExistsError:
-                        if not os.path.lexists(dest):
-                            raise
-                        summary.skipped_existing.append(rel)
-                        continue
                 if item.is_folder:
-                    folders.append((rel, item.modified_ms))
                     children = sorted(
                         deps.drive.list_children([item.id]),
                         key=lambda child: (nfc(child.name), child.id),
@@ -754,7 +783,7 @@ class Engine:
             except (OSError, NimboError):
                 summary.failed.append((rel, "restore_io_error"))
 
-    def verify(self, *, repair: bool = False, stop: Event | None = None) -> AuditReport:
+    def verify(self, *, repair: bool = False, stop: Event | None = None) -> ScanAuditReport:
         """Audit a full listing against freshly hashed local files.
 
         Release the audit lock before optional repair, which obtains its own
@@ -773,7 +802,7 @@ class Engine:
             report.repaired = self.run(trigger="verify", stop=stop)
         return report
 
-    def _audit(self, stop: Event) -> AuditReport:
+    def _audit(self, stop: Event) -> ScanAuditReport:
         deps = self._deps
         cfg = deps.cfg
         matcher = cfg.matcher()
@@ -798,9 +827,10 @@ class Engine:
                 remote.setdefault(rel, []).append(item)
         local = {rel: entry for rel, entry in result.entries.items() if in_scope(rel, entry.is_dir)}
         hasher = LocalHasher(cfg.source.root, deps.index, should_stop=stop.is_set)
-        report = AuditReport(
+        report = ScanAuditReport(
             extra_remote=sorted(remote.keys() - local.keys()),
             duplicates=sorted(rel for rel, items in remote.items() if len(items) > 1),
+            scan_problems=result.problems,
         )
         for rel, entry in sorted(local.items()):
             _check_stop(stop)

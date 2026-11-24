@@ -38,6 +38,16 @@ _STANDARD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dic
 _JSON_FIELDS = frozenset({"ts", "level", "logger", "msg", "exception", "stack"})
 _TRACEBACK_FORMATTER = logging.Formatter()
 _APPEND = os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+_INSPECT = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _private_log(fd: int) -> bool:
+    mode = os.fstat(fd).st_mode
+    if not stat.S_ISREG(mode):
+        return False
+    if stat.S_IMODE(mode) != 0o600:
+        os.fchmod(fd, 0o600)
+    return True
 
 
 def _replace_field(match: re.Match[str]) -> str:
@@ -125,7 +135,7 @@ class _LogHandler(logging.Handler):
             line = json.dumps(data) + "\n"
             path = self._directory / f"nimbo-{timestamp[:10]}.jsonl"
             with os.fdopen(os.open(path, _APPEND, 0o600), "a", encoding="utf-8") as handle:
-                if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                if _private_log(handle.fileno()):
                     handle.write(line)
         if self._stderr is not None:
             with suppress(Exception):
@@ -153,6 +163,13 @@ def setup_logging(paths: Paths, *, verbose: bool = False, stderr: bool = True) -
         if day < cutoff:
             with suppress(OSError):
                 path.unlink()
+        else:
+            with suppress(OSError):
+                fd = os.open(path, _INSPECT)
+                try:
+                    _private_log(fd)
+                finally:
+                    os.close(fd)
 
     root = logging.getLogger()
     for handler in root.handlers[:]:

@@ -26,6 +26,7 @@ from . import context, service
 from .context import safe_label
 from .fmt import human_size
 from .i18n import Translator
+from .run_history import read_run_summaries
 
 
 class Check(NamedTuple):
@@ -108,8 +109,9 @@ def _checks(paths: Paths, *, language: str) -> Iterator[tuple[Check, dict[str, s
             if integrity:
                 root_uuid = index.get_meta(META_ROOT_UUID)
                 try:
-                    last = index.last_run()
-                except (ValueError, TypeError, RecursionError):
+                    runs = read_run_summaries(index, limit=1)
+                    last = runs[0] if runs else None
+                except NimboError:
                     last_readable = False
     except (NimboError, OSError, ValueError, sqlite3.Error):
         integrity = False
@@ -129,7 +131,7 @@ def _checks(paths: Paths, *, language: str) -> Iterator[tuple[Check, dict[str, s
     )
     yield _check("db", integrity)
     if last is None:
-        yield _check("no_run", last_readable, critical=False)
+        yield _check("no_run", last_readable, critical=not last_readable)
     else:
         yield _check(
             "last",

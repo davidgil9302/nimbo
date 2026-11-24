@@ -32,9 +32,10 @@ from .errors import (
     UploadLimitExceeded,
 )
 from .index import META_FORCE_FULL, Index
-from .model import OWNER_PROPERTY, Op, OpKind, Phase, RemoteFile, drive_ms
+from .model import OWNER_PROPERTY, Op, OpKind, Phase, PlanIssue, RemoteFile, drive_ms, rel_join
 from .progress import ProgressTracker
 from .transfer import Uploader, UploadRequest
+from .tree import RemoteTree, _rel_component
 
 _CREATE = {OpKind.MKDIR, OpKind.UPLOAD}
 _WITH_PARENT = _CREATE | {OpKind.MOVE}
@@ -56,18 +57,26 @@ class ExecReport:
     failed: list[tuple[str, str]]
     stop_reason: str | None
     created_ids: list[str]
+    warnings: list[PlanIssue] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class _Run:
     id: int
     stop: Event
+    planned: RemoteTree
+    moving: set[str]
+    unconfirmed_trash: set[int]
     report: ExecReport = field(default_factory=lambda: ExecReport(Counter(), 0, [], None, []))
     lock: Lock = field(default_factory=Lock)
     aborted: Event = field(default_factory=Event)
     created_folders: set[str] = field(default_factory=set)
     pending_probe: list[str] = field(default_factory=list)
     last_refresh: float | None = None
+    refreshed: RemoteTree | None = None
+    trash_followups: deque[_Work] = field(default_factory=deque)
+    drift_rel: str | None = None
+    index_dirty: bool = False
 
     def request_stop(self, reason: str) -> None:
         with self.lock:
@@ -96,6 +105,7 @@ class _Work:
     op: Op
     deferrals: int = 0
     md5_retries: int = 0
+    trash_uncertain: bool = False
 
 
 class _Retry(Enum):
@@ -109,6 +119,39 @@ class _LocalReadError(NimboError):
 
 class _ProgressError(RuntimeError):
     pass
+
+
+class _TrashConfirmed(Exception):
+    def __init__(self, item: RemoteFile) -> None:
+        self.item = item
+
+
+class _FolderKept(RemoteChanged):
+    def __init__(self, children: list[Op]) -> None:
+        super().__init__()
+        self.children = children
+
+
+def _same_item(planned: RemoteFile, current: RemoteFile | None) -> bool:
+    if current is None or current.trashed or current.is_google_native:
+        return False
+    if planned.is_folder and current.is_folder:
+        # Folder timestamps can change as a side effect of edits to their children.
+        return (planned.id, planned.name, planned.parents, planned.properties) == (
+            current.id,
+            current.name,
+            current.parents,
+            current.properties,
+        )
+    return current == planned
+
+
+def _first_drift(before: RemoteTree, after: RemoteTree) -> str | None:
+    for rel, item in before.walk():
+        current = after.get(item.id)
+        if item.id not in after or (current != item and not _same_item(item, current)):
+            return rel
+    return next((rel for rel, item in after.walk() if item.id not in before), None)
 
 
 def _stop_reason(error: NimboError) -> str | None:
@@ -162,6 +205,7 @@ class Executor:
         self._uploader = uploader
         self._index = index
         self._source_root = source_root
+        self._real_source_root = source_root.resolve()
         self._properties = {OWNER_PROPERTY: root_uuid}
         self._tracker = tracker
         self._stop = stop
@@ -193,7 +237,17 @@ class Executor:
                 raise ValueError(f"{op.kind} {op.rel!r} requires a name")
             phases[op.phase].append(_Work(op))
 
-        run = _Run(run_id, self._stop)
+        run = _Run(
+            run_id,
+            self._stop,
+            self._index.load_tree(self._root_id or ""),
+            {op.file_id for op in ops if op.kind is OpKind.MOVE and op.file_id is not None},
+            {
+                op.db_id
+                for op in self._index.inflight_ops()
+                if op.kind is OpKind.TRASH and op.db_id is not None
+            },
+        )
         for phase, pending in phases.items():
             if not run.can_start() or not self._refresh(run):
                 break
@@ -212,8 +266,14 @@ class Executor:
                     work = pending.popleft()
                     if self._execute_one(run, work):
                         pending.append(work)
+                    pending.extendleft(reversed(run.trash_followups))
+                    run.trash_followups.clear()
 
-        run.can_start()  # Observe cancellation even if the final operation completed.
+        # The last phase can commit writes after its initial refresh.
+        if run.can_start() and run.index_dirty and self._root_id is not None:
+            self._refresh(run)
+        if run.drift_rel is not None and not run.report.failed:
+            run.report.failed.append((run.drift_rel, "remote_changed"))
         self._tracker.flush(force=True)
         self._probe_created(run)
         return run.report
@@ -228,6 +288,10 @@ class Executor:
     def _refresh(self, run: _Run) -> bool:
         if self._refresh_remote is None:
             return True
+        root = self._root_id
+        before = run.refreshed if run.refreshed is not None else run.planned
+        if root is not None and run.index_dirty:
+            before = self._index.load_tree(root)
         force_full = self._index.get_meta(META_FORCE_FULL)
         try:
             self._probe_created(run)
@@ -250,6 +314,11 @@ class Executor:
             if force_full is not None and self._index.get_meta(META_FORCE_FULL) is None:
                 self._index.set_meta(META_FORCE_FULL, force_full)
         run.last_refresh = self._clock()
+        if root is not None:
+            run.refreshed = self._index.load_tree(root)
+            if run.drift_rel is None:
+                run.drift_rel = _first_drift(before, run.refreshed)
+        run.index_dirty = False
         return run.can_start()
 
     def _probe_created(self, run: _Run) -> None:
@@ -297,11 +366,16 @@ class Executor:
         op = work.op
         file_id = op.file_id
         assert file_id is not None
-        previous = self._index.get_remote(file_id) if op.kind is OpKind.TRASH else None
         while True:
             try:
-                self._check_scope(run, op, file_id, previous)
-                item, uploaded = self._apply(op, file_id)
+                self._check_index(run, op, file_id)
+                item, uploaded = self._apply(run, work, file_id)
+            except _FolderKept as exc:
+                self._failure(run, work, exc)
+                run.report.warnings.append(PlanIssue("folder-kept-protected", op.rel))
+                self._index.save_ops(run.id, exc.children)
+                run.trash_followups.extend(_Work(child) for child in exc.children)
+                return False
             except (
                 AuthError,
                 DriveError,
@@ -328,7 +402,7 @@ class Executor:
                         op,
                         remove_subtrees=[file_id],
                         trash_log_run=run.id,
-                        trashed_is_folder=(previous if previous is not None else item).is_folder,
+                        trashed_is_folder=item.is_folder,
                     )
                 else:
                     self._index.complete_op(
@@ -336,6 +410,7 @@ class Executor:
                     )
                 run.report.done[op.kind] += 1
                 run.report.uploaded_bytes += uploaded
+                run.index_dirty = True
                 if op.kind is OpKind.MKDIR:
                     run.created_folders.add(file_id)
                 if op.kind in _CREATE:
@@ -348,52 +423,203 @@ class Executor:
             self._tracker.op_done(op.rel)
             return False
 
-    def _check_scope(self, run: _Run, op: Op, file_id: str, previous: RemoteFile | None) -> None:
+    def _check_index(self, run: _Run, op: Op, file_id: str) -> None:
         root = self._root_id
         if root is None:
             return
-        if op.kind not in _CREATE and not self._index.in_subtree(file_id, root):
-            raise RemoteChanged
+        if op.kind not in _CREATE:
+            planned = run.planned.get(file_id)
+            if (
+                not self._index.in_subtree(file_id, root)
+                or file_id == root
+                or planned is None
+                or not _same_item(planned, self._index.get_remote(file_id))
+            ):
+                raise RemoteChanged
+            source = op.src_rel if op.kind is OpKind.MOVE else op.rel
+            if (
+                source is not None
+                and run.refreshed is not None
+                and run.refreshed.rel_of(file_id) != source
+            ):
+                raise RemoteChanged
         if op.kind in _WITH_PARENT:
             parent = op.parent_id
             assert parent is not None
-            if not self._index.in_subtree(parent, root) and not (
-                parent in run.created_folders and self._drive.live_folder_in_subtree(parent, root)
-            ):
+            if not self._index.in_subtree(parent, root) and parent not in run.created_folders:
                 raise RemoteChanged
-        if op.kind is OpKind.TRASH:
+            refreshed = run.refreshed
+            if refreshed is None or (parent in run.created_folders and parent not in refreshed):
+                return
+            if op.parent_rel is not None and refreshed.rel_of(parent) != op.parent_rel:
+                raise RemoteChanged
+            for item in refreshed.children(parent):
+                if item.id != file_id and _rel_component(item.name) == op.name:
+                    current = self._index.get_remote(item.id)
+                    if current is not None and parent in current.parents:
+                        raise RemoteChanged
+
+    def _check_destination(self, op: Op, file_id: str) -> None:
+        parent = op.parent_id
+        root = self._root_id
+        if root is None or parent is None:
+            return
+        if not self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel):
+            raise RemoteChanged
+        if op.name is not None and any(
+            item.id != file_id for item in self._drive.list_children([parent], name=op.name)
+        ):
+            raise RemoteChanged
+
+    def _check_live_parent(self, item: RemoteFile, rel: str | None) -> None:
+        root = self._root_id
+        if root is not None and (
+            len(item.parents) != 1
+            or not self._drive.live_folder_in_subtree(
+                item.parents[0], root, rel=rel.rpartition("/")[0] if rel is not None else None
+            )
+        ):
+            raise RemoteChanged
+
+    def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> None:
+        expected: dict[str, tuple[RemoteFile, str]] = {}
+        pending = [(folder.id, op.rel)]
+        for parent, rel in pending:
+            for child in run.planned.children(parent):
+                if child.id in run.moving or child.is_google_native:
+                    continue
+                child_rel = rel_join(rel, _rel_component(child.name))
+                expected[child.id] = child, child_rel
+                if child.is_folder:
+                    pending.append((child.id, child_rel))
+        if sum(not child.is_folder for child, _ in expected.values()) != op.affected_files:
+            raise RemoteChanged
+
+        # Walk only confirmed planned folders. A foreign folder and its contents
+        # are protected even when some planned file IDs have moved into it.
+        folders = [folder.id]
+        covered: dict[str, RemoteFile] = {}
+        blocked: set[str] = set()
+        for parent in folders:
+            for live in self._drive.list_children([parent]):
+                match = expected.get(live.id)
+                if match is None or live.parents != (parent,) or not _same_item(match[0], live):
+                    blocked.add(parent)
+                    continue
+                covered[live.id] = live
+                if live.is_folder:
+                    folders.append(live.id)
+        if not blocked:
+            return
+        for child_id in reversed(folders[1:]):
+            if child_id in blocked:
+                blocked.add(covered[child_id].parents[0])
+
+        counts: Counter[str] = Counter()
+        for child, _ in reversed(list(expected.values())):
+            counts[child.parents[0]] += counts[child.id] + int(not child.is_folder)
+        raise _FolderKept(
+            [
+                Op(
+                    OpKind.TRASH,
+                    expected[item.id][1],
+                    op.reason,
+                    file_id=item.id,
+                    affected_files=counts[item.id] if item.is_folder else 1,
+                )
+                for item in covered.values()
+                if item.id not in blocked and item.parents[0] in blocked
+            ]
+        )
+
+    def _trash(self, run: _Run, work: _Work, file_id: str) -> RemoteFile:
+        op = work.op
+        planned = run.planned.get(file_id)
+        if planned is None:
+            raise RemoteChanged
+        sent = op.db_id in run.unconfirmed_trash
+
+        def before_send() -> None:
+            nonlocal sent
             live = self._drive.get(file_id)
-            if live is None or live.trashed:
+            if live is not None and live.id == file_id and live.trashed and sent:
+                raise _TrashConfirmed(live)
+            if live is None and sent:
+                work.trash_uncertain = True
+            if live is None or not _same_item(planned, live):
                 raise RemoteChanged
-            if previous is None or previous.parents != live.parents:
-                if not self._refresh(run):
-                    raise Stopped
-                live = self._drive.get(file_id)
-                previous = self._index.get_remote(file_id)
-                if (
-                    live is None
-                    or live.trashed
-                    or previous is None
-                    or previous.parents != live.parents
-                    or not self._index.in_subtree(file_id, root)
+            self._check_live_parent(live, op.rel)
+            if live.is_folder:
+                self._check_folder_trash(run, op, live)
+            sent = True
+
+        try:
+            item = self._drive.update_metadata(
+                file_id, trashed=True, before_send=before_send, should_stop=self._stop.is_set
+            )
+            if item.id == file_id and item.trashed:
+                return item
+            raise DriveError("Drive did not confirm trash")
+        except _TrashConfirmed as confirmed:
+            return confirmed.item
+        except (DriveError, AuthError) as error:
+            if sent and (
+                not isinstance(error, DriveError) or error.retryable or error.status < 400
+            ):
+                work.trash_uncertain = True
+                try:
+                    live = self._drive.get(file_id)
+                except (DriveError, AuthError):
+                    pass  # Keep the durable intent for the next run to reconcile.
+                else:
+                    if live is not None and live.id == file_id and live.trashed:
+                        return live
+                    work.trash_uncertain = live is None
+            raise
+
+    def _apply(self, run: _Run, work: _Work, file_id: str) -> tuple[RemoteFile, int]:
+        op = work.op
+        if op.kind in _UPLOAD:
+            return self._upload(op, file_id, run.planned.get(file_id))
+        if op.kind is OpKind.TRASH:
+            return self._trash(run, work, file_id), 0
+        stop = self._stop.is_set
+
+        def check_metadata() -> None:
+            self._check_destination(op, file_id)
+            if self._root_id is None or op.kind in _CREATE:
+                return
+            previous = run.planned.get(file_id)
+            live = self._drive.get(file_id)
+            if previous is None or live is None:
+                raise RemoteChanged
+            source = op.src_rel if op.kind is OpKind.MOVE else op.rel
+            if not _same_item(previous, live):
+                # An earlier retryable request may already have changed the item.
+                if not (
+                    not live.trashed
+                    and live.mime_type == previous.mime_type
+                    and (live.size, live.md5) == (previous.size, previous.md5)
+                    and live.name == (op.name if op.kind is OpKind.MOVE else previous.name)
+                    and live.parents
+                    == ((op.parent_id,) if op.kind is OpKind.MOVE else previous.parents)
+                    and (live.is_folder or live.modified_ms == drive_ms(op.mtime_ns))
+                    and live.owner_root == self._properties[OWNER_PROPERTY]
                 ):
                     raise RemoteChanged
-            # An ancestor can move without changing this item's direct parent.
-            if len(live.parents) != 1 or not self._drive.live_folder_in_subtree(
-                live.parents[0], root
-            ):
-                raise RemoteChanged
+                source = op.rel
+            self._check_live_parent(live, source)
 
-    def _apply(self, op: Op, file_id: str) -> tuple[RemoteFile, int]:
-        if op.kind in _UPLOAD:
-            return self._upload(op, file_id)
         if op.kind is OpKind.MKDIR:
             assert op.parent_id is not None and op.name is not None
             item = self._drive.create_folder(
-                file_id=file_id, name=op.name, parent_id=op.parent_id, properties=self._properties
+                file_id=file_id,
+                name=op.name,
+                parent_id=op.parent_id,
+                properties=self._properties,
+                before_send=check_metadata,
+                should_stop=stop,
             )
-        elif op.kind is OpKind.TRASH:
-            item = self._drive.update_metadata(file_id, trashed=True)
         elif op.kind is OpKind.MOVE:
             previous = self._index.get_remote(file_id)
             is_folder = previous.is_folder if previous is not None else op.mtime_ns == 0
@@ -405,14 +631,20 @@ class Executor:
                 properties=self._properties,
                 add_parent=add_parent,
                 remove_parents=[op.src_parent_id] if add_parent and op.src_parent_id else (),
+                before_send=check_metadata,
+                should_stop=stop,
             )
         else:
             item = self._drive.update_metadata(
-                file_id, modified_ms=drive_ms(op.mtime_ns), properties=self._properties
+                file_id,
+                modified_ms=drive_ms(op.mtime_ns),
+                properties=self._properties,
+                before_send=check_metadata,
+                should_stop=stop,
             )
         return item, 0
 
-    def _upload(self, op: Op, file_id: str) -> tuple[RemoteFile, int]:
+    def _upload(self, op: Op, file_id: str, planned: RemoteFile | None) -> tuple[RemoteFile, int]:
         def on_bytes(delta: int) -> None:
             try:
                 self._tracker.transfer(op.rel, delta, op.size)
@@ -431,6 +663,9 @@ class Executor:
             name=None if update else op.name,
             parent_id=None if update else op.parent_id,
             properties=self._properties,
+            source_root=self._real_source_root,
+            destination_rel=op.rel,
+            expected_remote=planned if update else None,
         )
         try:
             outcome = self._uploader.upload(
@@ -469,10 +704,10 @@ class Executor:
             run.request_stop(reason)
         with run.lock:
             # A previous HTTP attempt can have committed even if its reply was lost.
-            # Once FAILED, the op is no longer reconciled by ID. Do not rely on the
-            # changes feed to find an unconfirmed create before the next plan.
+            # Do not rely on the feed to find an unconfirmed write before the next plan.
             self._index.set_meta(META_FORCE_FULL, "1")
-            self._index.fail_op(op, code)
+            if not work.trash_uncertain:
+                self._index.fail_op(op, code)
             run.report.failed.append((op.rel, code))
         return None
 

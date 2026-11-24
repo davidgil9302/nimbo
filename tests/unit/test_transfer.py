@@ -275,7 +275,26 @@ def test_completed_session_detected_on_resume(remote: _Harness) -> None:
     remote.fake.calls.clear()
     result = remote.uploader().upload(req)
     assert result.bytes_sent == 0 and result.local_md5 == hashlib.md5(_LARGE).hexdigest()
-    assert [(call.method, call.status) for call in remote.fake.calls] == [("PUT", 200)]
+    assert [(call.method, call.status) for call in remote.fake.calls] == [
+        ("PUT", 200),
+        ("GET", 200),
+    ]
+    assert remote.session(req) is None
+
+
+def test_completed_session_rejects_a_now_trashed_file(remote: _Harness) -> None:
+    req = remote.request()
+    remote.fake.faults.add(Fault(_final_put, "crash_after"))
+    with pytest.raises(SimulatedCrash):
+        remote.uploader().upload(req)
+    remote.drive.update_metadata(req.file_id, trashed=True)
+    before = remote.fake.write_count()
+
+    with pytest.raises(RemoteChanged):
+        remote.uploader().upload(req)
+
+    assert remote.fake.file(req.file_id).trashed
+    assert remote.fake.write_count() == before
     assert remote.session(req) is None
 
 
@@ -297,10 +316,8 @@ def test_create_conflict_after_completion_is_success(remote: _Harness, data: byt
 
 
 @pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
-def test_create_existing_with_wrong_content_switches_to_update(
-    remote: _Harness, data: bytes
-) -> None:
-    """Repair same-size corruption found after the reserved ID returns HTTP 409."""
+def test_create_existing_with_wrong_content_is_not_accepted(remote: _Harness, data: bytes) -> None:
+    """Leave bytes at an occupied ID intact when they differ from the create request."""
     req = remote.request(data)
     remote.uploader().upload(req)
     remote.fake.set_content(req.file_id, b"X" + data[1:], keep_modified=True)
@@ -308,24 +325,20 @@ def test_create_existing_with_wrong_content_switches_to_update(
     assert (corrupted.size, corrupted.modified_ms) == (req.size, drive_ms(req.mtime_ns))
 
     remote.fake.calls.clear()
-    deltas: list[int] = []
-    result = remote.uploader().upload(req, on_bytes=deltas.append)
+    with pytest.raises(Conflict):
+        remote.uploader().upload(req)
 
-    assert result.file.id == req.file_id
-    assert result.file.md5 == result.local_md5 == hashlib.md5(data).hexdigest()
-    assert remote.fake.file(req.file_id).content == data
+    assert remote.fake.file(req.file_id) == corrupted
     assert [item.id for item in remote.fake.find(remote.fake.root_id, req.rel)] == [req.file_id]
-    assert [(call.method, call.status) for call in remote.fake.calls[:3]] == [
+    assert [(call.method, call.status) for call in remote.fake.calls] == [
         ("POST", 409),
         ("GET", 200),
-        ("PATCH", 200),
     ]
-    assert sum(deltas) == req.size
     assert remote.session(req) is None and remote.session(replace(req, update=True)) is None
 
 
 @pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
-@pytest.mark.parametrize("foreign", ["folder", "name", "parent"])
+@pytest.mark.parametrize("foreign", ["folder", "name", "parent", "trashed"])
 def test_existing_object_not_ours_still_conflicts(
     remote: _Harness, data: bytes, foreign: str
 ) -> None:
@@ -337,6 +350,9 @@ def test_existing_object_not_ours_still_conflicts(
         )
     elif foreign == "name":
         remote.uploader().upload(replace(req, name="another"))
+    elif foreign == "trashed":
+        remote.uploader().upload(req)
+        remote.drive.update_metadata(req.file_id, trashed=True)
     else:
         parent = remote.fake.add_folder("another")
         remote.uploader().upload(replace(req, parent_id=parent))
@@ -434,16 +450,14 @@ def test_md5_mismatch_raises(remote: _Harness, data: bytes, update: bool) -> Non
 def test_resume_interrupted_create_repair(remote: _Harness) -> None:
     """Resume the update session created by a prior call with the original create request."""
     req = remote.request()
-    remote.uploader().upload(req)
-    remote.fake.set_content(req.file_id, b"X" + _LARGE[1:], keep_modified=True)
     remote.fake.faults.add(
         Fault(
             lambda request: _data_put(request) and request.url.path.endswith("/" + req.file_id),
             "crash_after",
         )
     )
-    with pytest.raises(SimulatedCrash):
-        remote.uploader().upload(req)
+    with _corrupt_uploads(remote, req, _LARGE, count=1) as uploader, pytest.raises(SimulatedCrash):
+        uploader.upload(req)
     repair = replace(req, update=True)
     assert remote.session(req) is None and remote.session(repair) is not None
 

@@ -445,12 +445,15 @@ class Index:
         return runs[0] if runs else None
 
     def save_ops(self, run_id: int, ops: Sequence[Op]) -> None:
-        """Journal pending operations for an existing run and assign IDs after commit."""
+        """Append pending operations to a run and assign IDs after commit."""
         assigned: list[tuple[Op, int]] = []
         with self._lock:
             with self._transaction(write=True):
                 updated_at = utc_now_iso()
-                for seq, op in enumerate(ops):
+                first = self._execute(
+                    "SELECT coalesce(max(seq) + 1, 0) FROM op WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+                for seq, op in enumerate(ops, start=first):
                     cursor = self._execute(
                         _INSERT_OP,
                         (
@@ -536,10 +539,15 @@ class Index:
             self._update_op(op, OpState.PENDING)
 
     def inflight_ops(self) -> list[Op]:
-        """Return all in-flight operations in journal insertion order."""
+        """Return unconfirmed writes, including legacy failed trashes with uncertain outcomes."""
         with self._transaction():
             rows = self._execute(
-                "SELECT * FROM op WHERE state = ? ORDER BY id", (OpState.INFLIGHT,)
+                """
+                SELECT * FROM op WHERE state = ?
+                OR (kind = ? AND state = ? AND error IN ('network_failed', 'server_error'))
+                ORDER BY id
+                """,
+                (OpState.INFLIGHT, OpKind.TRASH, OpState.FAILED),
             )
             return [_op_row(row) for row in rows]
 

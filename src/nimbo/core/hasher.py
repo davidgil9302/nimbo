@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
-from nimbo.core.errors import Stopped
+from nimbo.core.errors import FileChanged, Stopped
 from nimbo.core.model import LocalEntry
 
 _CHUNK_SIZE = 4 << 20
@@ -74,6 +74,16 @@ def _matches_entry(info: os.stat_result, entry: LocalEntry) -> bool:
     )
 
 
+def check_source_scope(handle: BinaryIO, real_root: Path, rel: str) -> None:
+    """Raise FileChanged unless the open descriptor resolves below the source root."""
+    try:
+        opened = Path(os.readlink(f"/proc/self/fd/{handle.fileno()}"))  # noqa: PTH115
+    except OSError as exc:
+        raise FileChanged(rel) from exc
+    if not opened.is_absolute() or not opened.is_relative_to(real_root) or opened == real_root:
+        raise FileChanged(rel)
+
+
 class LocalHasher:
     """Hash regular files beneath a source root with a metadata cache.
 
@@ -90,6 +100,7 @@ class LocalHasher:
     ) -> None:
         """Use ``index`` for digests and check ``should_stop`` between reads."""
         self._root = root
+        self._real_root = root.resolve()
         self._index = index
         self._should_stop = should_stop
         self.hashed_bytes: int = 0
@@ -123,14 +134,16 @@ class LocalHasher:
             if not _matches_entry(before, entry):
                 return None
             with open(path, "rb", buffering=0, opener=_open_regular_candidate) as handle:
+                check_source_scope(handle, self._real_root, entry.rel)
                 opened = os.fstat(handle.fileno())
                 if not os.path.samestat(before, opened) or not _matches_entry(opened, entry):
                     return None
                 digest = _md5_stream(handle, _CHUNK_SIZE, self._should_stop, self._count_read)
+                check_source_scope(handle, self._real_root, entry.rel)
                 after = path.lstat()
                 if not os.path.samestat(opened, after) or not _matches_entry(after, entry):
                     return None
             self._index.put_hash(*key, digest)
-        except OSError:
+        except (FileChanged, OSError):
             return None
         return digest

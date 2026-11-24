@@ -214,7 +214,7 @@ def test_create_folder_idempotent_after_dropped_response(harness: _Harness) -> N
     ]
 
 
-@pytest.mark.parametrize("different", ["name", "parent", "type"])
+@pytest.mark.parametrize("different", ["name", "parent", "type", "trashed"])
 def test_create_folder_conflict_with_different_item_raises(
     harness: _Harness, different: str
 ) -> None:
@@ -224,6 +224,9 @@ def test_create_folder_conflict_with_different_item_raises(
         occupied = fake.add_file("docs", fake.root_id, b"x")
     elif different == "name":
         occupied = fake.add_folder("other")
+    elif different == "trashed":
+        occupied = fake.add_folder("docs")
+        drive.update_metadata(occupied, trashed=True)
     else:
         occupied = fake.add_folder("docs", fake.add_folder("elsewhere"))
     with pytest.raises(Conflict, match="already in use"):

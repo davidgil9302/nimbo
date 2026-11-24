@@ -91,7 +91,7 @@ class RunDetailScreen(Panel[None]):
         self._run = run
 
     def compose(self) -> ComposeResult:
-        """Present the timestamp, summary and any operation failures."""
+        """Present the timestamp, summary and any failures or warnings."""
         t, run = self.t, self._run
         stamp = parse_time(run.started_at)
         if stamp is not None and stamp.tzinfo:
@@ -131,6 +131,13 @@ class RunDetailScreen(Panel[None]):
                     ),
                     markup=False,
                 )
+            for warning in run.warnings:
+                reason = f"reason.{warning.code}"
+                message = t(reason if t.has(reason) else "tui.error.operation")
+                yield Static(
+                    f"{line(warning.rel)} · {message}",
+                    markup=False,
+                )
         yield self.footer(self._undo)
 
     @on(Button.Pressed, "#undo-run")
@@ -160,6 +167,9 @@ class RunDetailScreen(Panel[None]):
                     message=t(reason if t.has(reason) else "tui.error.operation"),
                 )
             )
+        status.extend(
+            f"{line(path)} · {t('reason.restore_exists')}" for path in summary.skipped_existing
+        )
         self._outcome.update("\n".join(status))
         self._outcome.display = True
         self._undo.disabled = not summary.failed

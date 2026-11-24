@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -19,6 +20,7 @@ from nimbo.core.config import Config, OAuthConfig, SafetyConfig, SourceConfig, T
 from nimbo.core.drive import DriveClient
 from nimbo.core.engine import Engine, EngineDeps
 from nimbo.core.errors import AuthError, FileChanged, LockedError
+from nimbo.core.executor import ExecReport
 from nimbo.core.index import (
     META_ACCOUNT,
     META_CHANGES_RELIABLE,
@@ -37,6 +39,7 @@ from nimbo.core.model import (
     Op,
     OpKind,
     OpState,
+    PlanIssue,
     RunResult,
     RunSummary,
     drive_ms,
@@ -833,6 +836,38 @@ def test_crash_mid_run_then_reconcile_converges(mirror: _Harness, write: int) ->
     assert mirror.fake.write_count() == writes
 
 
+def test_trash_crash_window_item_gone_has_no_undo_entry(mirror: _Harness) -> None:
+    path = mirror.put("Docs/purged", b"gone")
+    mirror.run()
+    docs = mirror.fake.find(mirror.target, "Docs")[0].id
+    item = mirror.fake.find(docs, path.name)[0]
+    path.unlink()
+    mirror.fake.faults.add(Fault(_patch, "crash_after"))
+
+    with pytest.raises(SimulatedCrash):
+        mirror.run()
+    assert mirror.fake.file(item.id).trashed
+    # The trash was emptied before the next run: the item is gone for good.
+    mirror.fake._state.delete(item.id)
+
+    mirror.reopen()
+    next_run = mirror.run()
+    assert mirror.index.inflight_ops() == []
+    assert mirror.index.trash_log(next_run.run_id) == []
+    assert mirror.engine.undo().untrashed == 0
+
+
+def test_executor_warnings_reach_the_run_summary() -> None:
+    summary = RunSummary(7, RunResult.OK)
+    report = ExecReport(Counter(), 0, [("Docs/old", "remote_changed")], None, [])
+    report.warnings.append(PlanIssue("folder-kept-protected", "Docs/old"))
+
+    Engine._record_report(summary, report)
+
+    assert summary.result is RunResult.PARTIAL
+    assert PlanIssue("folder-kept-protected", "Docs/old") in summary.warnings
+
+
 @pytest.mark.parametrize("preview_first", [False, True])
 def test_trash_crash_window_still_undoable(mirror: _Harness, preview_first: bool) -> None:
     path = mirror.put("Docs/crashed", b"restore")
@@ -902,3 +937,113 @@ def test_unexpected_error_is_logged_and_finishes_run(
     assert any(record.exc_info for record in caplog.records)
     assert not mirror.paths.progress_file.exists()
     assert mirror.deps.notifier.calls == [(summary, True)]
+
+
+def test_nfc_collision_is_partial_and_keeps_remote_copies(mirror: _Harness) -> None:
+    composed = "Docs/Café"
+    decomposed = "Docs/Cafe\u0301"
+    mirror.put(composed, b"original")
+    mirror.run()
+    docs = mirror.fake.find(mirror.target, "Docs")[0].id
+    original = mirror.fake.find(docs, "Café")[0].id
+    other = mirror.fake.add_file("Cafe\u0301", docs, b"second copy")
+    mirror.put(decomposed, b"different version")
+
+    summary = mirror.run(result=RunResult.PARTIAL)
+
+    assert {w.rel for w in summary.warnings if w.code == "nfc-collision"} == {composed, decomposed}
+    assert summary.updated == summary.uploaded == summary.trashed == 0
+    assert mirror.fake.file(original).content == b"original"
+    assert mirror.fake.file(other).content == b"second copy"
+    assert not mirror.fake.file(original).trashed and not mirror.fake.file(other).trashed
+    assert {p.rel for p in mirror.engine.verify().scan_problems} == {composed, decomposed}
+
+
+@pytest.mark.parametrize("blocked", ["Docs/hidden", "Docs"])
+def test_unreadable_scan_is_partial_and_auditable(
+    mirror: _Harness, monkeypatch: pytest.MonkeyPatch, blocked: str
+) -> None:
+    mirror.put("Docs/hidden/report", b"previous")
+    mirror.run()
+    initial = mirror.fake.snapshot(mirror.target)
+    last_ok = mirror.index.folder_stats()["Docs"].last_ok
+    mirror.clock.now += timedelta(minutes=1)
+    mirror.put("Docs/hidden/report", b"new data")
+    scandir = os.scandir
+
+    def blocked_scandir(path):
+        if path == mirror.root / blocked:
+            raise PermissionError(13, "Permission denied")
+        return scandir(path)
+
+    monkeypatch.setattr("nimbo.core.scanner.os.scandir", blocked_scandir)
+    summary = mirror.run(result=RunResult.PARTIAL)
+    assert any(w.rel == blocked and w.code == "unreadable" for w in summary.warnings)
+    assert mirror.fake.snapshot(mirror.target) == initial
+    assert mirror.index.folder_stats()["Docs"].last_ok == last_ok
+    assert [p.rel for p in mirror.engine.verify().scan_problems] == [blocked]
+
+
+def test_scan_with_invalid_name_can_persist_partial_summary(mirror: _Harness) -> None:
+    os.mkdir(os.fsencode(mirror.root / "Docs") + b"/bad\xff")
+    summary = mirror.run(result=RunResult.PARTIAL)
+    assert [(w.code, w.rel) for w in summary.warnings] == [("invalid-name", r"Docs/bad\udcff")]
+
+
+def test_undo_descends_into_existing_folders_and_keeps_local_files(mirror: _Harness) -> None:
+    missing = mirror.put("Docs/old/deeper/missing", b"restore")
+    kept = mirror.put("Docs/old/deeper/kept", b"old contents")
+    mirror.run()
+    missing.unlink()
+    kept.unlink()
+    missing.parent.rmdir()
+    missing.parent.parent.rmdir()
+    deleted = mirror.run()
+    mirror.put("Docs/old/deeper/kept", b"local contents")
+    mirror.put("Docs/old/new", b"local addition")
+
+    summary = mirror.engine.undo(deleted.run_id)
+
+    assert summary.failed == []
+    assert summary.skipped_existing == ["Docs/old/deeper/kept"]
+    assert (summary.untrashed, summary.restored_files) == (1, 1)
+    assert missing.read_bytes() == b"restore"
+    assert kept.read_bytes() == b"local contents"
+    assert mirror.run().trashed == 0
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_approval_rejects_replaced_folder_descendant_id(mirror: _Harness, directory: bool) -> None:
+    mirror.deps.cfg = replace(mirror.deps.cfg, safety=SafetyConfig(max_deletes=0))
+    deleted = mirror.put("Docs/old/approved", b"old")
+    (deleted.parent / "empty").mkdir()
+    mirror.run()
+    docs = mirror.fake.find(mirror.target, "Docs")[0].id
+    folder = mirror.fake.find(docs, "old")[0].id
+    name = "empty" if directory else "approved"
+    approved_id = mirror.fake.find(folder, name)[0].id
+    (deleted.parent / "empty").rmdir()
+    deleted.unlink()
+    deleted.parent.rmdir()
+    awaiting = mirror.run(result=RunResult.NEEDS_CONFIRMATION)
+    assert awaiting.fingerprint is not None
+    write_approval(mirror.paths.approval_file, awaiting.fingerprint, now=mirror.clock())
+
+    outside = mirror.fake.add_folder("Outside")
+    mirror.deps.drive.update_metadata(approved_id, add_parent=outside, remove_parents=[folder])
+    new_id = (
+        mirror.fake.add_folder(name, folder)
+        if directory
+        else mirror.fake.add_file(name, folder, b"new")
+    )
+
+    assert mirror.engine.preview().brake.fingerprint != awaiting.fingerprint
+    waiting_again = mirror.run(result=RunResult.NEEDS_CONFIRMATION)
+    assert waiting_again.fingerprint != awaiting.fingerprint
+    assert waiting_again.trashed == 0
+    assert not mirror.fake.file(folder).trashed and not mirror.fake.file(new_id).trashed
+
+    assert waiting_again.fingerprint is not None
+    write_approval(mirror.paths.approval_file, waiting_again.fingerprint, now=mirror.clock())
+    assert mirror.run().trashed == 1
+    assert mirror.fake.file(new_id).trashed

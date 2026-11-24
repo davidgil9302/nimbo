@@ -276,6 +276,7 @@ class Op:
     affected_files: int = 0  # TRASH: files removed, descendants included
     disk_rel: str | None = None  # UPLOAD/UPDATE: on-disk rel path when it differs from ``rel``
     db_id: int | None = None  # row id once persisted
+    trash_ids_digest: str | None = None  # folder TRASH: digest of all covered Drive IDs
 
     @property
     def phase(self) -> Phase:

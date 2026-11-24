@@ -6,6 +6,7 @@ import errno
 import os
 import re
 import stat
+from collections import Counter
 from collections.abc import Callable, Sequence
 from operator import attrgetter
 from pathlib import Path
@@ -96,6 +97,7 @@ def scan(
             continue
 
         initial_entries = len(result.entries)
+        initial_problems = len(result.problems)
         pending: list[LocalEntry] = []
         _schedule_directory(
             path,
@@ -115,7 +117,7 @@ def scan(
                 _unreadable(result, parent.rel, error)
                 continue
 
-            seen: set[str] = set()
+            sibling_counts = Counter(nfc(child.name) for child in ordered)
             subdirs: list[LocalEntry] = []
             for child in ordered:
                 visited += 1
@@ -132,10 +134,12 @@ def scan(
 
                 canonical = nfc(name)
                 rel = rel_join(parent.rel, canonical)
-                if rel in seen:
-                    result.problems.append(ScanProblem("nfc-collision", rel, name))
+                if sibling_counts[canonical] > 1:
+                    result.problems.append(
+                        ScanProblem("nfc-collision", rel_join(disk_parent, name))
+                    )
+                    result.protected.append(rel)
                     continue
-                seen.add(rel)
 
                 try:
                     info = child.stat(follow_symlinks=False)
@@ -171,7 +175,11 @@ def scan(
 
             pending.extend(reversed(subdirs))
 
-        if len(result.entries) == initial_entries + 1 and folder not in result.protected:
+        if (
+            len(result.entries) == initial_entries + 1
+            and len(result.problems) == initial_problems
+            and folder not in result.protected
+        ):
             result.empty_folders.append(folder)
 
     result.protected = sorted(set(result.protected))

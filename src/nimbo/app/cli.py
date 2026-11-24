@@ -51,6 +51,7 @@ from . import doctor, service, wizard
 from .context import build_engine, safe_label, validate_state_paths
 from .fmt import human_duration, human_size
 from .i18n import Translator, detect_language
+from .run_history import read_run_summaries
 
 _SCHEMA = 1
 _EXIT_CODES = {
@@ -294,7 +295,8 @@ def _last_run(paths: Paths) -> RunSummary | None:
     if not paths.db_file.exists():
         return None
     with closing(Index.open_readonly(paths.db_file)) as index:
-        return index.last_run()
+        runs = read_run_summaries(index, limit=1)
+        return runs[0] if runs else None
 
 
 def _status(
@@ -303,7 +305,8 @@ def _status(
     last, stats = None, {}
     if paths.db_file.exists():
         with closing(Index.open_readonly(paths.db_file)) as index:
-            last, stats = index.last_run(), index.folder_stats()
+            runs = read_run_summaries(index, limit=1)
+            last, stats = (runs[0] if runs else None), index.folder_stats()
     units = service.service_state()
     if json_output:
         config = (
@@ -454,7 +457,7 @@ def _history(
     runs = []
     if paths.db_file.exists():
         with closing(Index.open_readonly(paths.db_file)) as index:
-            runs = index.list_runs(limit=count)
+            runs = read_run_summaries(index, limit=count)
     if json_output:
         _json({"runs": [run.to_dict() for run in runs]})
     elif runs:
@@ -589,6 +592,8 @@ def _print_summary(console: Console, t: Translator, summary: RunSummary, *, comp
     console.print(table)
     for rel, code in summary.failed:
         console.print(Text(f"{safe_label(rel)} · {_reason(t, code)}"))
+    for warning in summary.warnings:
+        console.print(Text(f"{safe_label(warning.rel)} · {_reason(t, warning.code)}"))
     if summary.result is RunResult.NEEDS_CONFIRMATION:
         console.print(Text(t("cli.confirm_next")))
 
@@ -710,6 +715,8 @@ def _undo(paths: Paths, cfg: Config, t: Translator, console: Console, run_id: in
     )
     for rel, code in summary.failed:
         console.print(Text(f"{safe_label(rel)} · {_reason(t, code)}"))
+    for rel in summary.skipped_existing:
+        console.print(Text(f"{safe_label(rel)} · {t('reason.restore_exists')}"))
     return 1 if summary.failed else 0
 
 
@@ -732,6 +739,8 @@ def _verify(paths: Paths, cfg: Config, t: Translator, console: Console, *, repai
     for label, paths_with_issue in changes.items():
         for rel in paths_with_issue:
             console.print(Text(f"{t(f'cli.audit.{label}')} · {safe_label(rel)}"))
+    for problem in report.scan_problems:
+        console.print(Text(f"{safe_label(problem.rel)} · {_reason(t, problem.code)}"))
     if report.repaired is not None:
         _print_summary(console, t, report.repaired, compact=False)
         result = exit_code(report.repaired.result)
@@ -739,14 +748,23 @@ def _verify(paths: Paths, cfg: Config, t: Translator, console: Console, *, repai
             return result
         assert final is not None
         remaining = any(
-            (final.missing_remote, final.extra_remote, final.mismatched, final.duplicates)
+            (
+                final.missing_remote,
+                final.extra_remote,
+                final.mismatched,
+                final.duplicates,
+                final.scan_problems,
+            )
         )
+        for problem in final.scan_problems:
+            console.print(Text(f"{safe_label(problem.rel)} · {_reason(t, problem.code)}"))
         console.print(Text(t("cli.audit.remaining" if remaining else "cli.audit.clean")))
         return int(remaining)
-    if not any(changes.values()):
+    if not any(changes.values()) and not report.scan_problems:
         console.print(Text(t("cli.audit.clean")))
         return 0
-    console.print(Text(t("cli.audit.repair_hint")))
+    if any(changes.values()):
+        console.print(Text(t("cli.audit.repair_hint")))
     return 1
 
 
@@ -874,6 +892,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _usage_error(parser)
     console = Console(highlight=False)
     stderr = Console(stderr=True, highlight=False)
+    if getattr(args, "client_secret", None) is not None:
+        stderr.print(Text(t("cli.client_secret_warning"), style="yellow"))
     try:
         dashboard = args.command is None and sys.stdout.isatty()
         if (

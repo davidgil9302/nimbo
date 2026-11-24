@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
 import os
 import socket
 import stat
@@ -15,7 +17,7 @@ from pathlib import Path
 from nimbo.core.config import Config, SafetyConfig
 from nimbo.core.errors import SafetyError
 from nimbo.core.fsutil import read_json, write_json
-from nimbo.core.model import SENTINEL_NAME, About, BrakeDecision, Plan, utc_now_iso
+from nimbo.core.model import SENTINEL_NAME, About, BrakeDecision, OpKind, Plan, utc_now_iso
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +151,16 @@ def evaluate_brakes(plan: Plan, cfg: SafetyConfig) -> BrakeDecision:
     ]
     if stats.trashed_files > cfg.max_deletes:
         reasons.append("too_many_deletes")
-    return BrakeDecision(bool(reasons), tuple(sorted(reasons)), plan.fingerprint())
+    fingerprint = plan.fingerprint()
+    digests = sorted(
+        op.trash_ids_digest
+        for op in plan.ops
+        if op.kind is OpKind.TRASH and op.trash_ids_digest is not None
+    )
+    if digests:
+        payload = json.dumps([fingerprint, digests], separators=(",", ":"))
+        fingerprint = hashlib.sha256(payload.encode("ascii")).hexdigest()
+    return BrakeDecision(bool(reasons), tuple(sorted(reasons)), fingerprint)
 
 
 def check_space(plan: Plan, about: About) -> Problem | None:

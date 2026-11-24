@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -178,3 +179,22 @@ def test_logging_failure_is_silent_and_stderr_is_optional(
     logger.info("well formed")
     assert capsys.readouterr().err == ""
     assert logs.read_log_tail(paths) == []
+
+
+def test_new_and_existing_logs_are_private(paths: Paths, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(logs, "utc_now_iso", lambda: "2026-11-23T20:00:00+00:00")
+    paths.log_dir.mkdir(parents=True)
+    old = paths.log_dir / "nimbo-2026-11-22.jsonl"
+    old.write_text("{}", encoding="utf-8")
+    old.chmod(0o644)
+
+    logs.setup_logging(paths, stderr=False)
+    logger = logging.getLogger("nimbo.tests")
+    logger.warning("first")
+    latest = paths.log_dir / "nimbo-2026-11-23.jsonl"
+    assert stat.S_IMODE(latest.stat().st_mode) == 0o600
+    latest.chmod(0o644)
+    logger.warning("second")
+
+    assert stat.S_IMODE(old.stat().st_mode) == 0o600
+    assert stat.S_IMODE(latest.stat().st_mode) == 0o600

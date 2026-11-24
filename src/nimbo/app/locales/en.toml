@@ -62,6 +62,7 @@ foreign_owner = "The item belongs to another Nimbo backup. Choose a different de
 foreign-owner = "The item belongs to another Nimbo backup. Choose a different destination folder."
 db_too_new = "A newer version of Nimbo created the local index. Update Nimbo to open it."
 db_readonly = "The local index is read-only. Check that your account can write to the Nimbo state folder."
+run_history_damaged = "The local index contains a damaged run record. Run backup diagnostico to check it."
 remote_changed = "An item changed in Drive during the backup. Review the pending changes and run the backup again."
 remote_missing = "An item is no longer available in Drive. Check whether it was moved, sent to the trash, or its access changed."
 local_vanished = "A file disappeared from your computer during the backup. Check its location and try again."
@@ -69,6 +70,7 @@ local_unreadable = "A file couldn't be read on your computer. Check its permissi
 file_in_use = "A file kept changing during the backup. Save your changes, close the file, and try again."
 move_rejected = "Google Drive rejected the move. Check folder permissions and try again."
 unreadable = "This item couldn't be read. Check its permissions on your computer."
+scan_incomplete = "Some source paths could not be backed up. Check the warnings in the run details."
 symlink = "The symbolic link was skipped. To back up its contents, select the original folder."
 special-file = "A special file was skipped. If you need its data, save it as a regular file."
 nfc-collision = "Two names match after normalization. Rename one of them and run the backup again."
@@ -81,6 +83,7 @@ folder-kept-protected = "The folder was kept in your Drive because it contains i
 folder_ratio = "A large share of a folder's items would move to the trash in Drive. Review the list before confirming."
 too_many_deletes = "The plan exceeds the limit on items that can move to the trash without confirmation. Review the list before continuing."
 unsafe_restore_path = "The original location can't be used safely. Review the path before restoring."
+restore_exists = "An item already exists at this path and was kept."
 unsafe_restore_target = "Nimbo couldn't verify the restore destination. Check the original folder in your Drive."
 
 [result]

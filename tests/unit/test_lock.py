@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import select
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -94,3 +95,17 @@ def test_is_locked(tmp_path: Path) -> None:
     assert path.stat().st_ino == before.st_ino
     with RunLock(path):
         assert is_locked(path)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_lock_file_is_private(tmp_path: Path, existing: bool) -> None:
+    path = tmp_path / "nimbo.lock"
+    if existing:
+        path.touch()
+        path.chmod(0o644)
+    old_umask = os.umask(0o022)
+    try:
+        with RunLock(path):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        os.umask(old_umask)

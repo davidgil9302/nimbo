@@ -380,3 +380,26 @@ def test_md5_file_rejects_nonpositive_chunk_size(tmp_path: Path, chunk_size: int
 
     with pytest.raises(ValueError, match="chunk_size"):
         md5_file(path, chunk_size=chunk_size)
+
+
+def test_hasher_rejects_descriptor_outside_source_after_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "source"
+    branch = root / "branch"
+    branch.mkdir(parents=True)
+    path = branch / "file"
+    path.write_bytes(b"data")
+    entry = _entry(path, root)
+    outside = tmp_path / "outside"
+    original = os.open
+
+    def swap_before_open(candidate: str, flags: int) -> int:
+        branch.rename(outside)
+        branch.symlink_to(outside, target_is_directory=True)
+        return original(candidate, flags)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    hasher = LocalHasher(root, _Cache())
+    assert hasher.md5(entry) is None
+    assert hasher.hashed_bytes == 0

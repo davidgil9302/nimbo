@@ -448,8 +448,20 @@ def _trash_ops(
         if remote.parents[file_id] not in covered:
             rel = remote.rels[file_id]
             reason = "invalid-name" if _invalid(rel) else trash[file_id]
+            ids_digest = None
+            if remote.items[file_id].is_folder:
+                ids = sorted([file_id, *remote.descendants(file_id)])
+                payload = json.dumps(ids, ensure_ascii=True, separators=(",", ":"))
+                ids_digest = hashlib.sha256(payload.encode("ascii")).hexdigest()
             ops.append(
-                Op(OpKind.TRASH, rel, reason, file_id=file_id, affected_files=covered[file_id])
+                Op(
+                    OpKind.TRASH,
+                    rel,
+                    reason,
+                    file_id=file_id,
+                    affected_files=covered[file_id],
+                    trash_ids_digest=ids_digest,
+                )
             )
     return ops
 

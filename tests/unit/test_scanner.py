@@ -281,34 +281,23 @@ def test_invalid_utf8_name_reported(source_root: Path) -> None:
     assert result.protected == []
 
 
-def test_nfc_nfd_collision_keeps_one(source_root: Path) -> None:
-    """Choose the raw-name-first sibling even when the NFC spelling was created first."""
-    composed = "\u00e9"
-    decomposed = "e\u0301"
-    _write(source_root, f"Docs/{composed}/second")
-    _write(source_root, f"Docs/{decomposed}/first")
+@pytest.mark.parametrize("suffix", ["", "/child"])
+def test_nfc_collision_protects_all_spellings(source_root: Path, suffix: str) -> None:
+    """Skip both spellings without walking either colliding directory."""
+    composed = "Docs/é"
+    decomposed = "Docs/e\u0301"
+    _write(source_root, composed + suffix)
+    _write(source_root, decomposed + suffix)
 
     result = scan(source_root, ["Docs"], _Matcher())
 
-    assert set(result.entries) == {"Docs", f"Docs/{composed}", f"Docs/{composed}/first"}
-    assert len(result.problems) == 1
-    assert result.problems[0].code == "nfc-collision"
-    assert result.problems[0].rel == f"Docs/{composed}"
-    assert result.protected == []
-
-
-def test_collision_winner_disk_path(source_root: Path) -> None:
-    """Keep the exact path and metadata of the raw-name-first file in a collision."""
-    _write(source_root, "Docs/\u00e9.txt", b"loser")
-    winner = _write(source_root, "Docs/e\u0301.txt", b"winner")
-
-    result = scan(source_root, ["Docs"], _Matcher())
-
-    entry = result.entries["Docs/\u00e9.txt"]
-    assert entry.disk == "Docs/e\u0301.txt"
-    assert source_root / entry.disk_rel == winner
-    assert entry.size == len(b"winner")
-    assert result.protected == []
+    assert result.entries.keys() == {"Docs"}
+    assert result.problems == [
+        ScanProblem("nfc-collision", decomposed),
+        ScanProblem("nfc-collision", composed),
+    ]
+    assert result.protected == [composed]
+    assert result.empty_folders == []
 
 
 def test_disk_path_set_for_nfd_names(source_root: Path) -> None:

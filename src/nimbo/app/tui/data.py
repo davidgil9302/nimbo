@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from nimbo.app import service
+from nimbo.app.run_history import read_run_summaries
 from nimbo.core.config import Config, load_config
 from nimbo.core.index import META_QUOTA_LIMIT, META_QUOTA_USED, Index
 from nimbo.core.lock import is_locked
@@ -102,35 +103,12 @@ def _index_exists(paths: Paths) -> bool:
     return True
 
 
-def _check_run(run: RunSummary) -> None:
-    # Deserialization checks the result enum, but leaves the other JSON fields untyped.
-    if not all(
-        isinstance(value, str)
-        for value in (run.reason, run.started_at, run.finished_at, run.trigger)
-    ) or (run.fingerprint is not None and not isinstance(run.fingerprint, str)):
-        raise ValueError("Invalid run metadata")
-    for count in (run.uploaded, run.uploaded_bytes, run.updated, run.moved, run.trashed):
-        _count(count)
-    if run.run_id is not None:
-        _count(run.run_id)
-    if not isinstance(run.trash_preview, list) or not all(
-        isinstance(path, str) for path in run.trash_preview
-    ):
-        raise ValueError("Invalid deletion preview")
-    for path, code in run.failed:
-        if not isinstance(path, str) or not isinstance(code, str):
-            raise ValueError("Invalid operation failure")
-
-
 def load_runs(paths: Paths, *, limit: int = 50) -> list[RunSummary]:
     """Read recent finished runs, propagating a malformed or unreadable index."""
     if not _index_exists(paths):
         return []
     with closing(Index.open_readonly(paths.db_file)) as index:
-        runs = index.list_runs(limit=limit)
-    for run in runs:
-        _check_run(run)
-    return runs
+        return read_run_summaries(index, limit=limit)
 
 
 def _index_data(
@@ -139,9 +117,7 @@ def _index_data(
     if not _index_exists(paths):
         return (), {}, None, None
     with closing(Index.open_readonly(paths.db_file)) as index:
-        runs = tuple(index.list_runs(limit=4))
-        for run in runs:
-            _check_run(run)
+        runs = tuple(read_run_summaries(index, limit=4))
         stats = index.folder_stats()
         for row in stats.values():
             _count(row.bytes_local)

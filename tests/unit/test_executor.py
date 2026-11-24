@@ -22,7 +22,16 @@ from nimbo.core.errors import AuthError
 from nimbo.core.executor import Executor
 from nimbo.core.filters import Matcher
 from nimbo.core.index import META_FORCE_FULL, Index
-from nimbo.core.model import OWNER_PROPERTY, LocalEntry, Op, OpKind, OpState, RemoteFile, drive_ms
+from nimbo.core.model import (
+    OWNER_PROPERTY,
+    LocalEntry,
+    Op,
+    OpKind,
+    OpState,
+    RemoteFile,
+    RunResult,
+    drive_ms,
+)
 from nimbo.core.planner import PlannerOptions, make_plan
 from nimbo.core.progress import ProgressTracker, read_progress
 from nimbo.core.ratelimit import RateLimiter, RetryPolicy
@@ -30,6 +39,7 @@ from nimbo.core.remote_sync import RemoteIndexer
 from nimbo.core.transfer import Uploader, create_session_kind
 from nimbo.core.tree import RemoteTree
 from tests.fakedrive import FakeDrive, Fault, FaultPlan, SimulatedCrash
+from tests.system.helpers import make_mirror
 
 _CHUNK = 262144
 _OWNER = "mirror-owner"
@@ -1228,3 +1238,201 @@ def test_created_ids_capped_at_first_twenty(remote: _Harness) -> None:
     assert report.created_ids == [_id(op) for op in ops[:20]]
     assert report.done == Counter({OpKind.MKDIR: 19, OpKind.UPLOAD: 4})
     remote.check_mirror()
+
+
+@pytest.mark.parametrize("kind", [OpKind.MKDIR, OpKind.UPLOAD, OpKind.MOVE, OpKind.UPDATE])
+def test_refresh_revalidates_pending_write(remote: _Harness, kind: OpKind) -> None:
+    root = remote.fake.add_folder("Target")
+    if kind is OpKind.MKDIR:
+        op = remote.mkdir("new", parent=root)
+    elif kind is OpKind.UPLOAD:
+        op = remote.upload("new", parent=root)
+    elif kind is OpKind.MOVE:
+        existing = remote.fake.add_file("old", root, b"old")
+        op = Op(kind, "new", "renamed", existing, parent_id=root, src_parent_id=root, name="new")
+    else:
+        existing = remote.fake.add_file("new", root, b"old")
+        op = remote.upload("new", parent=root, update=existing)
+    run, tracker = remote.persist([op])
+    collision = []
+
+    def refresh() -> None:
+        if not collision:
+            if kind is OpKind.UPDATE:
+                remote.fake.set_content(_id(op), b"remote edit")
+                collision.append(_id(op))
+            else:
+                collision.append(remote.fake.add_file("new", root, b"external"))
+        remote.index.replace_remote(item for _, item in remote.listing().walk())
+
+    before = remote.fake.write_count()
+    report = remote.executor(tracker, root_id=root, refresh_remote=refresh).execute(run, [op])
+
+    assert report.failed == [(op.rel, "remote_changed")]
+    assert remote.fake.write_count() == before
+    assert [item.id for item in remote.fake.find(root, "new")] == collision
+
+
+def test_refresh_reports_drift_with_no_pending_write(remote: _Harness) -> None:
+    root = remote.fake.add_folder("Target")
+    run, tracker = remote.persist([])
+
+    def refresh() -> None:
+        if not remote.fake.find(root, "late"):
+            remote.fake.add_file("late", root, b"external")
+        remote.index.replace_remote(item for _, item in remote.listing().walk())
+
+    report = remote.executor(tracker, root_id=root, refresh_remote=refresh).execute(run, [])
+
+    assert report.failed == [("late", "remote_changed")]
+    assert not report.done and remote.fake.write_count() == 0
+
+
+def test_folder_trash_preserves_nested_unplanned_children(remote: _Harness) -> None:
+    root = remote.fake.add_folder("Target")
+    folder = remote.fake.add_folder("obsolete", root)
+    nested = remote.fake.add_folder("nested", folder)
+    old = remote.fake.add_file("old", nested, b"old")
+    safe = remote.fake.add_folder("safe", folder)
+    remote.fake.add_file("remove", safe, b"old")
+    op = _trash("obsolete", folder, affected_files=2)
+    run, tracker = remote.persist([op])
+    unexpected = []
+
+    def refresh() -> None:
+        if not unexpected:
+            unexpected.extend(
+                [
+                    remote.fake.add_native("document", nested),
+                    remote.fake.add_file("late", nested, b"external"),
+                ]
+            )
+        remote.index.replace_remote(item for _, item in remote.listing().walk())
+
+    report = remote.executor(tracker, root_id=root, refresh_remote=refresh).execute(run, [op])
+
+    assert all(not remote.fake.file(item).trashed for item in [folder, nested, *unexpected])
+    assert remote.fake.file(old).trashed and remote.fake.file(safe).trashed
+    assert report.failed == [("obsolete", "remote_changed")]
+    assert [(issue.code, issue.rel) for issue in report.warnings] == [
+        ("folder-kept-protected", "obsolete")
+    ]
+    assert sorted(remote.index.trash_log(run)) == sorted(
+        [(old, "obsolete/nested/old", False), (safe, "obsolete/safe", True)]
+    )
+
+
+def test_failed_move_keeps_its_source_out_of_folder_trash(remote: _Harness) -> None:
+    root = remote.fake.add_folder("Target")
+    folder = remote.fake.add_folder("obsolete", root)
+    report_id = remote.fake.add_file("report", folder, b"keep")
+    old = remote.fake.add_file("old", folder, b"remove")
+    move = Op(
+        OpKind.MOVE,
+        "report",
+        "renamed",
+        report_id,
+        parent_id=root,
+        src_parent_id=folder,
+        name="report",
+    )
+    trash = _trash("obsolete", folder)
+    run, tracker = remote.persist([move, trash])
+    remote.fake.faults.add(Fault(_metadata(report_id), "status", status=403, times=2))
+
+    report = remote.executor(tracker, root_id=root).execute(run, [move, trash])
+
+    assert not remote.fake.file(folder).trashed and not remote.fake.file(report_id).trashed
+    assert remote.fake.file(old).trashed
+    assert report.failed == [("report", "move_rejected"), ("obsolete", "remote_changed")]
+    assert remote.index.trash_log(run) == [(old, "obsolete/old", False)]
+
+
+def test_multipart_update_checks_scope_after_executor_dispatch(
+    remote: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    existing = remote.fake.add_file("report", target, b"old")
+    op = remote.upload("report", b"new", parent=target, update=existing)
+    run, tracker = remote.persist([op])
+    original = remote.drive._multipart
+
+    def multipart(**kwargs: Any) -> RemoteFile:
+        remote.drive.update_metadata(existing, add_parent=outside, remove_parents=[target])
+        return original(**kwargs)
+
+    monkeypatch.setattr(remote.drive, "_multipart", multipart)
+    report = remote.executor(tracker, root_id=target).execute(run, [op])
+
+    assert report.failed == [("report", "remote_changed")]
+    assert remote.fake.file(existing).parents == (outside,)
+    assert remote.fake.file(existing).content == b"old"
+
+
+@pytest.mark.parametrize("probe_fails", [False, True])
+def test_lost_trash_response_is_undoable(tmp_path: Path, probe_fails: bool) -> None:
+    mirror = make_mirror(tmp_path, {"Docs/anchor": b"keep", "Docs/report": b"remove"})
+    with mirror.open() as session:
+        assert session.engine.run(trigger="manual").result is RunResult.OK
+        (docs,) = mirror.fake.find(mirror.target, "Docs")
+        (item,) = mirror.fake.find(docs.id, "report")
+        (mirror.root / "Docs/report").unlink()
+        mirror.fake.faults.add(Fault(_metadata(item.id), "drop_response"))
+        mirror.fake.faults.add(Fault(_metadata(item.id), "transport_error", times=7))
+        if probe_fails:
+            mirror.fake.faults.add(
+                Fault(
+                    lambda req: (
+                        req.method == "GET"
+                        and req.url.path == f"/drive/v3/files/{item.id}"
+                        and mirror.fake.file(item.id).trashed
+                    ),
+                    "transport_error",
+                    times=16,
+                )
+            )
+
+        summary = session.engine.run(trigger="manual")
+        assert mirror.fake.file(item.id).trashed
+        if probe_fails:
+            assert summary.result is RunResult.FAILED
+            assert [op.file_id for op in session.index.inflight_ops()] == [item.id]
+            recovered = session.engine.run(trigger="manual")
+            assert recovered.result is RunResult.OK
+        else:
+            assert summary.result is RunResult.OK
+            assert summary.trashed == 1
+        undo = session.engine.undo()
+        assert undo.untrashed == 1
+        assert (mirror.root / "Docs/report").read_bytes() == b"remove"
+
+
+def test_upload_rejects_source_outside_replaced_ancestor(remote: _Harness, tmp_path: Path) -> None:
+    op = remote.upload("sub/report", b"public")
+    run, tracker = remote.persist([op])
+    outside = tmp_path / "outside"
+    (remote.root / "sub").rename(outside)
+    (outside / "report").write_bytes(b"secret")
+    os.utime(outside / "report", ns=(op.mtime_ns, op.mtime_ns))
+    (remote.root / "sub").symlink_to(outside, target_is_directory=True)
+    before = remote.fake.write_count()
+
+    report = remote.executor(tracker).execute(run, [op])
+
+    assert report.failed == [(op.rel, "file_in_use")]
+    assert remote.fake.write_count() == before
+
+
+def test_cancelled_multipart_retry_starts_no_write(
+    remote: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    op = remote.upload("report")
+    run, tracker = remote.persist([op])
+    remote.fake.faults.add(Fault(_upload, "status", status=503))
+    monkeypatch.setattr(remote.drive, "_sleep", lambda _: remote.stop.set())
+    report = remote.executor(tracker).execute(run, [op])
+
+    assert report.stop_reason == "cancelled" and not report.done
+    assert [call.status for call in remote.fake.calls if call.path.startswith("/upload/")] == [503]
+    assert not remote.fake.find(remote.fake.root_id, "report")

@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Event
 from typing import Protocol, TypeVar
 
+from rich.console import RenderableType
 from textual.app import App
 from textual.worker import Worker
 
@@ -98,6 +99,21 @@ class NimboApp(App[int]):
     def on_unmount(self) -> None:
         """Release the app's worker pool after Textual cancels its workers."""
         self._io.shutdown(wait=False, cancel_futures=True)
+
+    def exit(
+        self,
+        result: int | None = None,
+        return_code: int = 0,
+        message: RenderableType | None = None,
+    ) -> None:
+        """Return a failing status if the dashboard is showing a database error."""
+        if (
+            return_code == 0
+            and self.snapshot is not None
+            and "tui.error.index" in self.snapshot.errors
+        ):
+            result = return_code = 1
+        super().exit(result, return_code, message)
 
     async def run_io(self, operation: Callable[[], _T]) -> _T:
         """Await blocking work on the dashboard's application-owned pool."""

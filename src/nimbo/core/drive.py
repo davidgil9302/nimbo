@@ -25,6 +25,7 @@ from .errors import (
     RateLimited,
     ServerError,
     SessionExpired,
+    Stopped,
     StorageQuotaExceeded,
     TransportFailed,
     Unauthorized,
@@ -32,6 +33,7 @@ from .errors import (
 )
 from .model import FILE_FIELDS, FOLDER_MIME, About, Change, ChangesPage, RemoteFile, rfc3339_from_ms
 from .ratelimit import RateLimiter, RetryPolicy, parse_retry_after
+from .tree import _rel_component
 
 DEFAULT_API_BASE = "https://www.googleapis.com"
 LIST_GROUP_MAX = 40
@@ -185,6 +187,8 @@ class DriveClient:
         session: bool = False,
         retry_http: bool = True,
         recover: Callable[[], _T | None] | None = None,
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> _T:
         if isinstance(url, str):
             url = self._api_base.join(url)
@@ -193,11 +197,15 @@ class DriveClient:
         refreshed = False
         attempt = 1
         while True:
+            if should_stop is not None and should_stop():
+                raise Stopped
             retry_after: float | None = None
             token = self._tokens.token()
             self._limiter.acquire(kind)
             request_headers = dict(headers or {})
             request_headers["Authorization"] = f"Bearer {token}"
+            if before_send is not None:
+                before_send()
             try:
                 try:
                     request = self._http.build_request(
@@ -209,6 +217,8 @@ class DriveClient:
                     )
                     # Keep the chosen field mask and any opaque session parameters.
                     request.url = url
+                    if should_stop is not None and should_stop():
+                        raise Stopped
                     with closing(
                         self._http.send(request, stream=True, auth=None, follow_redirects=False)
                     ) as response:
@@ -264,6 +274,9 @@ class DriveClient:
         method: str,
         path: str,
         metadata: Mapping[str, object],
+        *,
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
         **params: str,
     ) -> RemoteFile:
         return self._request(
@@ -273,6 +286,8 @@ class DriveClient:
             kind="write",
             params={"fields": FILE_FIELDS, **params},
             json_body=metadata,
+            before_send=before_send,
+            should_stop=should_stop,
         )
 
     def about(self) -> About:
@@ -304,18 +319,22 @@ class DriveClient:
         except NotFound:
             return None
 
-    def live_folder_in_subtree(self, folder_id: str, root_id: str) -> bool:
-        """Check live folder membership by following Drive's current parent links."""
+    def live_folder_in_subtree(
+        self, folder_id: str, root_id: str, *, rel: str | None = None
+    ) -> bool:
+        """Check current parent links and, when given, the expected relative path."""
         seen: set[str] = set()
+        names: list[str] = []
         while folder_id not in seen:
             seen.add(folder_id)
             folder = self.get(folder_id)
             if folder is None or folder.trashed or not folder.is_folder:
                 break
             if folder.id == root_id or folder_id == root_id:
-                return True
+                return rel is None or "/".join(reversed(names)) == rel
             if len(folder.parents) != 1:
                 break
+            names.append(_rel_component(folder.name))
             folder_id = folder.parents[0]
         return False
 
@@ -325,6 +344,7 @@ class DriveClient:
         *,
         include_trashed: bool = False,
         page_size: int = 1000,
+        name: str | None = None,
     ) -> Iterator[RemoteFile]:
         """Yield all direct children of 1 to 40 parents, or raise ValueError for other counts."""
         if not 1 <= len(parent_ids) <= LIST_GROUP_MAX:
@@ -333,6 +353,8 @@ class DriveClient:
         query = f"({clauses})"
         if not include_trashed:
             query += " and trashed = false"
+        if name is not None:
+            query += f" and name = {_literal(name)}"
         params: dict[str, str | int] = {
             "fields": f"nextPageToken,files({FILE_FIELDS})",
             "q": query,
@@ -394,7 +416,14 @@ class DriveClient:
         return ChangesPage(changes, data.get("nextPageToken"), data.get("newStartPageToken"))
 
     def create_folder(
-        self, *, file_id: str, name: str, parent_id: str, properties: Mapping[str, str]
+        self,
+        *,
+        file_id: str,
+        name: str,
+        parent_id: str,
+        properties: Mapping[str, str],
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> RemoteFile:
         """Create by generated ID, or return a matching folder after HTTP 409.
 
@@ -413,16 +442,26 @@ class DriveClient:
                     "parents": [parent_id],
                     "properties": dict(properties),
                 },
+                before_send=before_send,
+                should_stop=should_stop,
             )
         except Conflict:
             item = self.get(file_id)
-            if item is not None and item.is_folder and item.name == name:
-                if parent_id in item.parents:
-                    return item
-                if parent_id == "root":
+            if (
+                item is not None
+                and item.id == file_id
+                and not item.trashed
+                and item.is_folder
+                and item.name == name
+            ):
+                if parent_id == "root" and item.parents != (parent_id,):
                     root = self.get(parent_id)
-                    if root is not None and root.id in item.parents:
-                        return item
+                    if root is not None:
+                        parent_id = root.id
+                if item.parents == (parent_id,):
+                    if before_send is not None:
+                        before_send()
+                    return item
             raise
 
     def update_metadata(
@@ -435,6 +474,8 @@ class DriveClient:
         add_parent: str | None = None,
         remove_parents: Sequence[str] = (),
         trashed: bool | None = None,
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> RemoteFile:
         """Patch the supplied metadata and parent changes, returning the updated file."""
         metadata: dict[str, object] = {}
@@ -452,7 +493,12 @@ class DriveClient:
         if remove_parents:
             params["removeParents"] = ",".join(remove_parents)
         return self._metadata_write(
-            "PATCH", f"{_FILES}/{quote(file_id, safe='')}", metadata, **params
+            "PATCH",
+            f"{_FILES}/{quote(file_id, safe='')}",
+            metadata,
+            before_send=before_send,
+            should_stop=should_stop,
+            **params,
         )
 
     def multipart_upload(
@@ -488,6 +534,9 @@ class DriveClient:
         properties: Mapping[str, str] | None,
         update: bool,
         on_send: Callable[[int], None] | None = None,
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        validate_recovered: Callable[[RemoteFile], None] | None = None,
     ) -> RemoteFile:
         metadata = _media_metadata(file_id, name, parent_id, modified_ms, properties, update)
         metadata_bytes = json.dumps(metadata, ensure_ascii=False).encode()
@@ -506,6 +555,9 @@ class DriveClient:
             item = self.get(file_id)
             if (
                 item is not None
+                and not item.trashed
+                and not item.is_folder
+                and not item.is_google_native
                 and item.size == len(data)
                 and item.md5 == hashlib.md5(data, usedforsecurity=False).hexdigest()
                 and item.modified_ms == modified_ms
@@ -513,6 +565,8 @@ class DriveClient:
                     item.properties.get(key) == value for key, value in (properties or {}).items()
                 )
             ):
+                if validate_recovered is not None:
+                    validate_recovered(item)
                 return item
             return None
 
@@ -528,6 +582,8 @@ class DriveClient:
             },
             content=lambda: _media_body(data, on_send, prefix=prefix, suffix=suffix),
             recover=recover_update if update else None,
+            before_send=before_send,
+            should_stop=should_stop,
         )
 
     def start_resumable(
@@ -540,6 +596,8 @@ class DriveClient:
         modified_ms: int,
         properties: Mapping[str, str] | None,
         update: bool,
+        before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         """Open a resumable upload and return its session URL for durable storage."""
         metadata = _media_metadata(file_id, name, parent_id, modified_ms, properties, update)
@@ -559,9 +617,17 @@ class DriveClient:
             params={"fields": FILE_FIELDS, "uploadType": "resumable"},
             headers={"X-Upload-Content-Type": _BINARY, "X-Upload-Content-Length": str(size)},
             json_body=metadata,
+            before_send=before_send,
+            should_stop=should_stop,
         )
 
-    def resumable_status(self, url: str, size: int) -> int | RemoteFile:
+    def resumable_status(
+        self,
+        url: str,
+        size: int,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int | RemoteFile:
         """Return the next confirmed offset or the completed file. Raise SessionExpired on 404."""
         return self._request(
             "PUT",
@@ -570,6 +636,7 @@ class DriveClient:
             headers={"Content-Length": "0", "Content-Range": f"bytes */{size}"},
             content=b"",
             session=True,
+            should_stop=should_stop,
         )
 
     def resumable_put(self, url: str, chunk: bytes, offset: int, size: int) -> int | RemoteFile:
@@ -586,6 +653,7 @@ class DriveClient:
         on_send: Callable[[int], None] | None = None,
         recover: Callable[[], int | RemoteFile | None] | None = None,
         before_send: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int | RemoteFile:
         if not (size == offset == len(chunk) == 0 or 0 <= offset < offset + len(chunk) <= size):
             raise ValueError("Chunk does not fit the upload bounds")
@@ -597,11 +665,6 @@ class DriveClient:
                 raise ServerError("Drive did not advance the resumable upload", status=308)
             return position
 
-        def body() -> Iterable[bytes]:
-            if before_send is not None:
-                before_send()
-            return _media_body(chunk, on_send)
-
         return self._request(
             "PUT",
             self._session_url(url),
@@ -611,10 +674,12 @@ class DriveClient:
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {byte_range}/{size}",
             },
-            content=body,
+            content=lambda: _media_body(chunk, on_send),
             session=True,
             retry_http=recover is not None,
             recover=recover,
+            before_send=before_send,
+            should_stop=should_stop,
         )
 
     def download(
@@ -675,7 +740,13 @@ def _read_json(response: httpx.Response) -> dict[str, Any]:
 
 
 def _read_file(response: httpx.Response) -> RemoteFile:
-    return RemoteFile.from_api(_read_json(response))
+    raw = _read_json(response)
+    try:
+        return RemoteFile.from_api(raw)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DriveError(
+            "Drive returned invalid file metadata", status=response.status_code
+        ) from exc
 
 
 def _read_resumable(response: httpx.Response, size: int) -> int | RemoteFile:

@@ -6,6 +6,7 @@ import json
 import os
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ from nimbo.core.model import (
     Progress,
     RunResult,
     RunSummary,
+    ScanProblem,
     UndoSummary,
 )
 from nimbo.core.paths import Paths
@@ -712,3 +714,94 @@ raise SystemExit(cli.main(["--lang", "en", "ahora", "--aqui"]))
                 worker.kill()
         assert worker.returncode == 130, stderr
         assert "Stopped" in stdout
+
+
+@pytest.mark.parametrize("command", ["estado", "historial"])
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        '{"result":"ok","failed":null}',
+        '{"run_id":1,"result":"ok","uploaded":"bad count"}',
+        '{"run_id":1,"result":"ok","warnings":[{"code":null,"rel":"Docs/a"}]}',
+        '{"run_id":1}',
+    ],
+)
+def test_damaged_run_exits_with_localized_index_error(setup, capsys, command, invalid):
+    with sqlite3.connect(setup[0].db_file) as db:
+        db.execute("UPDATE run SET summary = ?", (invalid,))
+
+    assert cli.main(["--lang", "es", command, "--json"]) == 1
+
+    output = capsys.readouterr()
+    assert "índice local" in " ".join(output.err.split())
+    assert "Traceback" not in output.err
+
+
+@pytest.mark.parametrize(
+    ("command", "handler"), [("instalar", "install"), ("conectar", "reconnect")]
+)
+@pytest.mark.parametrize("language", ["en", "es"])
+def test_client_secret_option_warns_and_stays_supported(
+    setup, capsys, monkeypatch, command, handler, language
+):
+    received = []
+    monkeypatch.setattr(cli.wizard, handler, lambda *args, **kwargs: received.append(args) or 0)
+    secret = "synthetic-test-secret"
+    assert cli.main(["--lang", language, command, f"--client-secret={secret}"]) == 0
+    client = received[0][-1]
+    if handler == "install":
+        client = client.client
+    assert client.client_secret == secret
+    output = capsys.readouterr()
+    assert Translator(language)("cli.client_secret_warning") == " ".join(output.err.split())
+    assert secret not in output.err + output.out
+    assert cli.main(["--lang", language, command, "--help"]) == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--client-json" in help_text.split("--client-secret")[-1]
+
+
+def test_verificar_lists_scan_problems_and_exits_partial(setup, capsys, monkeypatch):
+    class Engine:
+        def verify(self, *, repair, stop):
+            return SimpleNamespace(
+                missing_remote=[],
+                extra_remote=[],
+                mismatched=[],
+                duplicates=[],
+                repaired=None,
+                scan_problems=[ScanProblem("unreadable", "Projects/blocked")],
+            )
+
+    monkeypatch.setattr(cli, "build_engine", lambda *args, **kwargs: (Engine(), lambda: None))
+    assert cli.main(["--lang", "en", "verificar"]) == 1
+    output = " ".join(capsys.readouterr().out.split())
+    assert "Projects/blocked" in output
+    assert Translator("en")("reason.unreadable") in output
+
+
+def test_partial_backup_prints_scan_warnings(capsys):
+    summary = RunSummary(
+        None,
+        RunResult.PARTIAL,
+        reason="scan_incomplete",
+        warnings=[PlanIssue("unreadable", "Projects/blocked")],
+    )
+    t = Translator("en")
+    cli._print_summary(Console(), t, summary, compact=False)
+    output = " ".join(capsys.readouterr().out.split())
+    assert "Projects/blocked" in output
+    assert t("reason.unreadable") in output
+
+
+def test_diagnostico_can_explain_damaged_run(setup, capsys, monkeypatch):
+    with sqlite3.connect(setup[0].db_file) as db:
+        db.execute("UPDATE run SET summary = ?", ('{"run_id":1}',))
+    monkeypatch.setattr(cli.doctor, "_cloud_checks", lambda cfg: iter(()))
+    monkeypatch.setattr(
+        cli.service, "service_state", lambda: ServiceState(False, False, False, None)
+    )
+
+    assert cli.main(["--lang", "es", "diagnostico"]) == 1
+    output = capsys.readouterr()
+    assert Translator("es")("doctor.no_run.bad") in " ".join(output.out.split())
+    assert "Traceback" not in output.err

@@ -89,6 +89,16 @@ client_secret = "<Desktop client secret>"
 | `oauth.client_id` | Required | Desktop client ID issued by Google. |
 | `oauth.client_secret` | Required | Desktop client secret issued by Google. |
 
+The ratio brake applies only when the number of planned file deletions in a
+folder reaches `safety.ratio_min_files`. A folder with fewer files than that
+threshold is exempt from the ratio brake. The separate total limit,
+`safety.max_deletes`, still applies.
+
+Between deep comparisons, routine backups can reuse cached hashes for files
+whose size and modification time match. Use `backup verificar` to rehash file
+contents after edits that preserve both values. `backup verificar --reparar`
+can apply the resulting changes with the usual safety checks.
+
 ## Exclusions
 
 The following is the default `exclude` array. In TOML it belongs above the

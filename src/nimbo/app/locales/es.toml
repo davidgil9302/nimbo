@@ -62,6 +62,7 @@ foreign_owner = "El elemento pertenece a otro respaldo de Nimbo. Elige una carpe
 foreign-owner = "El elemento pertenece a otro respaldo de Nimbo. Elige una carpeta de destino distinta."
 db_too_new = "Una versión más reciente de Nimbo creó el índice local. Actualiza Nimbo para abrirlo."
 db_readonly = "El índice local es de solo lectura. Revisa que tu cuenta pueda escribir en la carpeta de estado de Nimbo."
+run_history_damaged = "El índice local contiene un registro de ejecución dañado. Ejecuta backup diagnostico para revisarlo."
 remote_changed = "Un elemento cambió en Drive durante el respaldo. Revisa los pendientes y vuelve a respaldar."
 remote_missing = "Un elemento ya no está disponible en Drive. Revisa si se movió, si está en la papelera o si cambió su acceso."
 local_vanished = "Un archivo desapareció de tu computadora durante el respaldo. Revisa su ubicación y vuelve a intentarlo."
@@ -69,6 +70,7 @@ local_unreadable = "No se pudo leer un archivo en tu computadora. Revisa sus per
 file_in_use = "Un archivo seguía cambiando durante el respaldo. Guarda los cambios, cierra el archivo y vuelve a intentarlo."
 move_rejected = "Google Drive rechazó el movimiento. Revisa los permisos de las carpetas y vuelve a intentarlo."
 unreadable = "No se pudo leer este elemento. Revisa los permisos en tu computadora."
+scan_incomplete = "No se pudieron respaldar algunas rutas del origen. Revisa los avisos en los detalles de la ejecución."
 symlink = "Se omitió el enlace simbólico. Si quieres respaldar su contenido, selecciona la carpeta original."
 special-file = "Se omitió un tipo de archivo especial. Si necesitas sus datos, guárdalos como un archivo normal."
 nfc-collision = "Dos nombres se ven iguales al normalizarlos. Cambia uno de los nombres y vuelve a respaldar."
@@ -81,6 +83,7 @@ folder-kept-protected = "La carpeta se conservó en tu Drive porque contiene ele
 folder_ratio = "Una carpeta perdería gran parte de sus elementos en Drive. Revisa la lista de elementos antes de confirmar."
 too_many_deletes = "El plan supera el límite de elementos que se pueden enviar a la papelera sin confirmación. Revisa la lista antes de continuar."
 unsafe_restore_path = "La ubicación original no se puede usar de forma segura. Revisa la ruta antes de restaurar."
+restore_exists = "Ya existe un elemento en esta ruta y se conservó."
 unsafe_restore_target = "Nimbo no pudo verificar el destino de la restauración. Revisa la carpeta original en tu Drive."
 
 [result]

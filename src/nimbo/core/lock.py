@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 from pathlib import Path
 from typing import TextIO
 
@@ -26,8 +27,14 @@ class RunLock:
         if self._handle is not None:
             raise LockedError()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self._path.open("a+", encoding="utf-8")
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        handle = os.fdopen(os.open(self._path, flags, 0o600), "r+", encoding="utf-8")
         try:
+            mode = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise OSError("Lock path is not a regular file")
+            if stat.S_IMODE(mode) != 0o600:
+                os.fchmod(handle.fileno(), 0o600)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

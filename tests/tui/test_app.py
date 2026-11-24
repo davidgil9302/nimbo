@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import sqlite3
 from contextlib import closing
 from dataclasses import replace
 
@@ -312,5 +313,23 @@ def test_quit(dashboard):
             await pilot.press("q")
 
         assert app.return_value == 0
+
+    asyncio.run(run())
+
+
+def test_dashboard_reports_damaged_run_in_spanish_and_exits_with_error(dashboard, scenario):
+    with sqlite3.connect(scenario.paths.db_file) as db:
+        db.execute("UPDATE run SET summary = ?", ('{"result":"ok","failed":null}',))
+
+    async def run():
+        app = dashboard("es")
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert (
+                app.t("tui.error.index")
+                in app.screen.query_one("#dashboard-notice", Static).content
+            )
+            await pilot.press("q")
+        assert app.return_code == 1
 
     asyncio.run(run())
