@@ -74,13 +74,13 @@ def _matches_entry(info: os.stat_result, entry: LocalEntry) -> bool:
     )
 
 
-def check_source_scope(handle: BinaryIO, real_root: Path, rel: str) -> None:
-    """Raise FileChanged unless the open descriptor resolves below the source root."""
+def check_source_path(handle: BinaryIO, expected: Path, rel: str) -> None:
+    """Raise FileChanged unless the descriptor names the expected physical path."""
     try:
-        opened = Path(os.readlink(f"/proc/self/fd/{handle.fileno()}"))  # noqa: PTH115
+        opened = os.readlink(f"/proc/self/fd/{handle.fileno()}")  # noqa: PTH115
     except OSError as exc:
         raise FileChanged(rel) from exc
-    if not opened.is_absolute() or not opened.is_relative_to(real_root) or opened == real_root:
+    if opened != os.fspath(expected):
         raise FileChanged(rel)
 
 
@@ -125,7 +125,10 @@ class LocalHasher:
                     return cached
 
             disk_rel = Path(entry.disk_rel)
+            if disk_rel.is_absolute() or ".." in disk_rel.parts:
+                return None
             path = self._root / disk_rel
+            expected = self._real_root / disk_rel
             # The last relative parent is '.', which represents the configured root.
             for parent in reversed(disk_rel.parents[:-1]):
                 if not stat.S_ISDIR((self._root / parent).lstat().st_mode):
@@ -134,12 +137,12 @@ class LocalHasher:
             if not _matches_entry(before, entry):
                 return None
             with open(path, "rb", buffering=0, opener=_open_regular_candidate) as handle:
-                check_source_scope(handle, self._real_root, entry.rel)
+                check_source_path(handle, expected, entry.rel)
                 opened = os.fstat(handle.fileno())
                 if not os.path.samestat(before, opened) or not _matches_entry(opened, entry):
                     return None
                 digest = _md5_stream(handle, _CHUNK_SIZE, self._should_stop, self._count_read)
-                check_source_scope(handle, self._real_root, entry.rel)
+                check_source_path(handle, expected, entry.rel)
                 after = path.lstat()
                 if not os.path.samestat(opened, after) or not _matches_entry(after, entry):
                     return None

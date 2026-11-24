@@ -502,6 +502,21 @@ def test_file_changed_before_upload(remote: _Harness) -> None:
     assert not remote.fake.calls
 
 
+def test_upload_uses_disk_spelling_below_aliased_root(remote: _Harness) -> None:
+    req = remote.request(b"data")
+    actual_root = remote.root / "source"
+    actual_root.mkdir()
+    alias = remote.root / "alias"
+    alias.symlink_to(actual_root, target_is_directory=True)
+    path = alias / "Cafe\u0301.txt"
+    req.path.rename(path)
+    req = replace(req, rel="Café.txt", path=path, source_root=actual_root)
+
+    result = remote.uploader().upload(req)
+
+    assert remote.fake.file(result.file.id).content == b"data"
+
+
 @pytest.mark.parametrize("replacement", ["symlink", "fifo"])
 def test_replaced_upload_source_is_not_followed_or_opened(
     remote: _Harness, replacement: str
@@ -624,7 +639,7 @@ def test_download_verifies_and_sets_mtime(remote: _Harness) -> None:
     Downloader(remote.drive).download(file, dest, on_bytes=deltas.append)
     assert dest.read_bytes() == _LARGE and sum(deltas) == len(_LARGE)
     assert dest.stat().st_mtime_ns == 1_234_000_000
-    assert not dest.with_name(dest.name + PART_SUFFIX).exists()
+    assert not list(dest.parent.glob(f"*{PART_SUFFIX}"))
 
 
 @pytest.mark.parametrize("race", [False, True], ids=["already-exists", "appears-during-transfer"])
@@ -639,7 +654,7 @@ def test_download_never_overwrites(remote: _Harness, race: bool) -> None:
     with pytest.raises(FileExistsError):
         Downloader(remote.drive).download(file, dest, on_bytes=lambda _: dest.write_bytes(b"keep"))
     assert dest.read_bytes() == b"keep"
-    assert not dest.with_name(dest.name + PART_SUFFIX).exists()
+    assert not list(dest.parent.glob(f"*{PART_SUFFIX}"))
 
 
 def test_download_md5_mismatch_cleans_part(remote: _Harness) -> None:
@@ -651,7 +666,7 @@ def test_download_md5_mismatch_cleans_part(remote: _Harness) -> None:
     dest = remote.root / "notes"
     with pytest.raises(Md5Mismatch):
         Downloader(remote.drive).download(file, dest)
-    assert not dest.exists() and not dest.with_name(dest.name + PART_SUFFIX).exists()
+    assert not dest.exists() and not list(dest.parent.glob(f"*{PART_SUFFIX}"))
 
 
 def test_download_callback_failure_cleans_part(remote: _Harness) -> None:
@@ -666,7 +681,30 @@ def test_download_callback_failure_cleans_part(remote: _Harness) -> None:
 
     with pytest.raises(SimulatedCrash):
         Downloader(remote.drive).download(file, dest, on_bytes=interrupt)
-    assert not dest.exists() and not dest.with_name(dest.name + PART_SUFFIX).exists()
+    assert not dest.exists() and not list(dest.parent.glob(f"*{PART_SUFFIX}"))
+
+
+def test_download_does_not_timestamp_or_publish_substituted_staging_link(remote: _Harness) -> None:
+    file_id = remote.fake.add_file("notes", remote.fake.root_id, b"remote", modified_ms=1234)
+    file = remote.drive.get(file_id)
+    assert file is not None
+    dest = remote.root / "notes"
+    target = remote.root / "keep"
+    target.write_bytes(b"keep")
+    original_mtime = target.stat().st_mtime_ns
+
+    def replace_stage(_: int) -> None:
+        (part,) = dest.parent.glob(f"*{PART_SUFFIX}")
+        part.unlink()
+        part.symlink_to(target)
+
+    with pytest.raises(FileNotFoundError):
+        Downloader(remote.drive).download(file, dest, on_bytes=replace_stage)
+
+    assert not dest.exists() and not dest.is_symlink()
+    assert target.stat().st_mtime_ns == original_mtime and target.read_bytes() == b"keep"
+    (part,) = dest.parent.glob(f"*{PART_SUFFIX}")
+    assert part.readlink() == target
 
 
 def test_expired_session_after_update_does_not_write_new_revision(remote: _Harness) -> None:
@@ -710,17 +748,17 @@ def test_download_size_mismatch_cleans_part(remote: _Harness) -> None:
     dest = remote.root / "notes"
     with pytest.raises(Md5Mismatch):
         Downloader(remote.drive).download(replace(file, size=5), dest)
-    assert not dest.exists() and not dest.with_name(dest.name + PART_SUFFIX).exists()
+    assert not dest.exists() and not list(dest.parent.glob(f"*{PART_SUFFIX}"))
 
 
 def test_download_does_not_remove_another_transfers_part(remote: _Harness) -> None:
-    """Keep an existing staging file owned by another restore."""
+    """Restore alongside an existing staging file and leave it intact."""
     file_id = remote.fake.add_file("notes", remote.fake.root_id, b"remote")
     file = remote.drive.get(file_id)
     assert file is not None
     dest = remote.root / "notes"
     part = dest.with_name(dest.name + PART_SUFFIX)
     part.write_bytes(b"staged")
-    with pytest.raises(FileExistsError):
-        Downloader(remote.drive).download(file, dest)
-    assert not dest.exists() and part.read_bytes() == b"staged"
+    Downloader(remote.drive).download(file, dest)
+    assert dest.read_bytes() == b"remote" and part.read_bytes() == b"staged"
+    assert list(dest.parent.glob(f"*{PART_SUFFIX}")) == [part]

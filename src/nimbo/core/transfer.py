@@ -6,15 +6,17 @@ import errno
 import hashlib
 import os
 import stat
+import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from .drive import DriveClient
 from .errors import Conflict, FileChanged, Md5Mismatch, RemoteChanged, SessionExpired, Stopped
-from .hasher import check_source_scope
-from .model import PART_SUFFIX, RemoteFile, drive_ms
+from .hasher import check_source_path
+from .model import PART_SUFFIX, RemoteFile, drive_ms, nfc
 from .tree import _rel_component
 
 _BLOCK = 256 << 10
@@ -87,6 +89,20 @@ def _check_stat(req: UploadRequest, info: os.stat_result) -> None:
         raise FileChanged(req.rel)
 
 
+def _expected_source_path(req: UploadRequest) -> Path:
+    if req.source_root is None:
+        return req.path.absolute()
+    # The configured root can be an alias. Take the physical spelling of the
+    # relative components from the scan path without resolving any of them.
+    depth = len(Path(req.rel).parts)
+    disk_rel = Path(*req.path.parts[-depth:])
+    if not depth or disk_rel.is_absolute() or ".." in disk_rel.parts:
+        raise FileChanged(req.rel)
+    if nfc(disk_rel.as_posix()) != req.rel:
+        raise FileChanged(req.rel)
+    return req.source_root / disk_rel
+
+
 def _open_source(req: UploadRequest) -> BinaryIO:
     try:
         fd = os.open(req.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -115,12 +131,14 @@ class _UploadData:
         self,
         req: UploadRequest,
         source: BinaryIO,
+        expected_path: Path,
         on_bytes: Callable[[int], None] | None,
         root_id: str | None,
         check_create_parent: Callable[[str, str | None], bool | None] | None,
     ) -> None:
         self.req = req
         self.source = source
+        self.expected_path = expected_path
         self._on_bytes = on_bytes
         self.root_id = root_id
         self.check_create_parent = check_create_parent
@@ -134,8 +152,7 @@ class _UploadData:
         return self._digest.hexdigest()
 
     def read(self, offset: int, length: int) -> bytes:
-        if self.req.source_root is not None:
-            check_source_scope(self.source, self.req.source_root, self.req.rel)
+        check_source_path(self.source, self.expected_path, self.req.rel)
         self.source.seek(offset)
         chunk = self.source.read(length)
         if len(chunk) != length:
@@ -223,14 +240,14 @@ class Uploader:
         validation. Retries, recovered sessions and updates use live checks.
         """
         try:
+            expected = _expected_source_path(req)
             before = req.path.lstat()
             _check_stat(req, before)
             _check_stop(should_stop)
             with _open_source(req) as source:
-                if req.source_root is not None:
-                    check_source_scope(source, req.source_root, req.rel)
+                check_source_path(source, expected, req.rel)
                 _check_source(req, source, before)
-                data = _UploadData(req, source, on_bytes, root_id, check_create_parent)
+                data = _UploadData(req, source, expected, on_bytes, root_id, check_create_parent)
                 item = self._upload_verified(data, should_stop)
                 return UploadOutcome(item, data.md5, data.sent)
         except FileChanged:
@@ -307,8 +324,7 @@ class Uploader:
     @staticmethod
     def _check_path(data: _UploadData) -> None:
         req = data.req
-        if req.source_root is not None:
-            check_source_scope(data.source, req.source_root, req.rel)
+        check_source_path(data.source, data.expected_path, req.rel)
         try:
             path_stat = req.path.lstat()
         except FileNotFoundError as exc:
@@ -591,22 +607,35 @@ class Downloader:
         if os.path.lexists(dest):
             raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        part = dest.with_name(dest.name + PART_SUFFIX)
-        sink = part.open("x+b")
+        parent_fd = os.open(dest.parent, os.O_PATH | os.O_DIRECTORY)
         try:
-            with sink:
-                self._drive.download(file.id, sink, on_bytes=on_bytes)
-                size = sink.tell()
-                sink.seek(0)
-                digest = hashlib.file_digest(
-                    sink, lambda: hashlib.md5(usedforsecurity=False)
-                ).hexdigest()
-                if (size, digest) != (file.size, file.md5):
-                    raise Md5Mismatch(file.name)
-            if file.modified_ms is not None:
-                ns = file.modified_ms * 1_000_000
-                os.utime(part, ns=(ns, ns))
-            # Publish atomically without allowing replacement of an existing name.
-            os.link(part, dest)
+            # mkstemp creates a random name with O_CREAT | O_EXCL | O_NOFOLLOW and 0o600.
+            fd, part_name = tempfile.mkstemp(dir=f"/proc/self/fd/{parent_fd}", suffix=PART_SUFFIX)
+            part = Path(part_name)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w+b", closefd=False) as sink:
+                    self._drive.download(file.id, sink, on_bytes=on_bytes)
+                    size = sink.tell()
+                    sink.seek(0)
+                    digest = hashlib.file_digest(
+                        sink, lambda: hashlib.md5(usedforsecurity=False)
+                    ).hexdigest()
+                    if (size, digest) != (file.size, file.md5):
+                        raise Md5Mismatch(file.name)
+                if file.modified_ms is not None:
+                    ns = file.modified_ms * 1_000_000
+                    os.utime(fd, ns=(ns, ns))
+                # linkat follows the procfs descriptor link to the verified inode.
+                os.link(
+                    f"/proc/self/fd/{fd}", dest.name, dst_dir_fd=parent_fd, follow_symlinks=True
+                )
+            finally:
+                try:
+                    with suppress(FileNotFoundError):
+                        if os.path.samestat(part.lstat(), os.fstat(fd)):
+                            part.unlink()
+                finally:
+                    os.close(fd)
         finally:
-            part.unlink(missing_ok=True)
+            os.close(parent_fd)

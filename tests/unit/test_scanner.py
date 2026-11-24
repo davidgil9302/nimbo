@@ -103,8 +103,8 @@ def test_excluded_dirs_not_traversed(source_root: Path, monkeypatch: pytest.Monk
     _write(source_root, "Docs/keep")
     scandir = os.scandir
 
-    def guard(path: str | os.PathLike[str]) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
-        assert Path(path) != excluded
+    def guard(path: int) -> AbstractContextManager[Iterator[os.DirEntry[str]]]:
+        assert not os.path.samestat(os.fstat(path), excluded.stat())
         return scandir(path)
 
     monkeypatch.setattr(os, "scandir", guard)
@@ -399,13 +399,12 @@ def test_stat_failure_file_is_protected(source_root: Path, monkeypatch: pytest.M
         raise OSError(errno.EIO, "injected stat failure")
 
     @contextmanager
-    def inject_stat_failure(
-        path: str | os.PathLike[str],
-    ) -> Iterator[Iterator[os.DirEntry[str] | SimpleNamespace]]:
-        with scandir(path) as children:
+    def inject_stat_failure(fd: int) -> Iterator[Iterator[os.DirEntry[str] | SimpleNamespace]]:
+        in_parent = os.path.samestat(os.fstat(fd), blocked.parent.stat())
+        with scandir(fd) as children:
             yield (
-                SimpleNamespace(name=child.name, path=child.path, stat=fail_stat)
-                if Path(child.path) == blocked
+                SimpleNamespace(name=child.name, stat=fail_stat)
+                if in_parent and child.name == blocked.name
                 else child
                 for child in children
             )

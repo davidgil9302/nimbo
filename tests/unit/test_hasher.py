@@ -382,8 +382,9 @@ def test_md5_file_rejects_nonpositive_chunk_size(tmp_path: Path, chunk_size: int
         md5_file(path, chunk_size=chunk_size)
 
 
-def test_hasher_rejects_descriptor_outside_source_after_ancestor_swap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("inside_root", [False, True], ids=["outside", "inside"])
+def test_hasher_rejects_descriptor_at_wrong_path_after_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inside_root: bool
 ) -> None:
     root = tmp_path / "source"
     branch = root / "branch"
@@ -391,12 +392,13 @@ def test_hasher_rejects_descriptor_outside_source_after_ancestor_swap(
     path = branch / "file"
     path.write_bytes(b"data")
     entry = _entry(path, root)
-    outside = tmp_path / "outside"
+    other = (root if inside_root else tmp_path) / "other"
     original = os.open
 
     def swap_before_open(candidate: str, flags: int) -> int:
-        branch.rename(outside)
-        branch.symlink_to(outside, target_is_directory=True)
+        # Preserve the file's inode and metadata so only the path check can reject it.
+        branch.rename(other)
+        branch.symlink_to(other, target_is_directory=True)
         return original(candidate, flags)
 
     monkeypatch.setattr(os, "open", swap_before_open)
