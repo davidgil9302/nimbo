@@ -1,0 +1,182 @@
+# Keep this catalog in sync with the Spanish reference.
+
+[reason]
+ok = "The backup finished."
+partial = "Some changes are still pending. Check the history and run the backup again."
+failed = "An error interrupted the backup. Check the history to see what happened."
+needs_confirmation = "Some items are ready to move to the trash. Review the list and confirm if you want to continue."
+skipped = "The backup was skipped. Check the status to see what needs attention."
+cancelled = "The backup stopped. You can start it again whenever you're ready."
+paused = "The backup is paused. Pending changes will resume with the next backup."
+new = "New on your computer"
+changed = "The contents changed on your computer"
+metadata = "The modification date changed"
+renamed = "The name or location changed"
+adopted = "An identical copy is already in your Drive"
+deleted-locally = "Deleted from your computer"
+extraneous = "No longer part of the backup"
+duplicate = "Another copy is in your Drive"
+type-conflict = "A file and a folder have the same name"
+invalid-name = "This name can't be used in the backup. Review the name before continuing."
+error = "An error occurred during the backup. Run diagnostics to see what needs attention."
+config_invalid = "The configuration contains invalid settings. Review your settings or run backup install."
+already_running = "A backup is already running. Wait for it to finish."
+preflight_failed = "The backup couldn't start. Run backup doctor to see what needs attention."
+secret_store_unavailable = "The keyring is unavailable. Sign in to your desktop and try again."
+secret_store_locked = "The keyring is locked. Unlock it on your desktop and try again."
+auth_failed = "Nimbo couldn't sign in to Google. Run backup connect to link your account again."
+reauth_required = "Your Google authorization is no longer valid. Run backup connect to restore access to your Drive."
+auth_denied = "Access to your Drive was denied. Run backup connect and, if you'd like to continue, grant access in Google."
+auth_timeout = "The authorization timed out. Run backup connect and complete the step in your browser."
+auth_scope_missing = "Google didn't grant all the required permissions. Run backup connect and grant Drive access."
+auth_network = "Nimbo couldn't reach Google while connecting your account. Check your internet connection and try again."
+drive_error = "Google Drive couldn't complete the operation. Check the history and try again."
+network_failed = "The connection to Google Drive was interrupted. Check your internet connection and try again."
+rate_limited = "Google Drive received too many requests. Wait a few minutes and try again."
+server_error = "Google Drive had a temporary problem. Wait a few minutes and try again."
+unauthorized = "Google Drive rejected the authorization. Run backup connect to restore access."
+bad_request = "Google Drive rejected the request. Check the history to identify the affected item."
+forbidden = "Your account can't complete the operation in Drive. Check the permissions on the destination folder."
+not_found = "Google Drive couldn't find the item. Check that it's still in your Drive and your account can access it."
+conflict = "Google Drive found a conflict with an existing item. Review the pending changes before trying again."
+storage_quota_exceeded = "Your Drive ran out of space. Free up space or add storage, then run the backup again."
+upload_limit_exceeded = "You reached the daily Google Drive upload limit. Pending changes will resume with the next backup."
+upload_session_expired = "The upload session expired. Run the backup again to start a new one."
+file_changed = "The file changed while Nimbo was reading it. Save it on your computer and run the backup again."
+md5_mismatch = "The copy in Drive failed the integrity check. Run the backup again to retry it."
+stopped = "The backup stopped. You can start it again whenever you're ready."
+sentinel_missing = "The source folder marker is missing. Connect the correct drive and run backup install if it still needs to be set up."
+sentinel_mismatch = "The marker doesn't match the configured source. Connect the drive you chose when you installed Nimbo."
+source_not_mounted = "The source drive isn't mounted. Connect it and open it on your computer before running the backup."
+source_missing = "The source folder could not be found. Check its path in settings and make sure it's available."
+folder_missing = "A folder selected for backup is missing. Check that it's still in the source folder or update your selection."
+folder_empty = "A source folder is empty. Check that it's the right folder and its files are available."
+folder_unreadable = "A source folder couldn't be read. Check its permissions on your computer."
+network_unavailable = "Google Drive can't be reached. Check your internet connection and run the backup again."
+target_missing = "The destination folder couldn't be found in your Drive. Check that it exists and your account can access it."
+storage_insufficient = "Your Drive doesn't have enough space for these changes. Free up space or add storage."
+internal_error = "An unexpected error interrupted the backup. Run backup doctor and check the history before trying again."
+plan_inconsistent = "The backup plan contains conflicting changes. Review the pending changes and try again."
+plan-inconsistent = "The backup plan contains conflicting changes. Review the pending changes and try again."
+foreign_owner = "The item belongs to another Nimbo backup. Choose a different destination folder."
+foreign-owner = "The item belongs to another Nimbo backup. Choose a different destination folder."
+db_too_new = "A newer version of Nimbo created the local index. Update Nimbo to open it."
+db_readonly = "The local index is read-only. Check that your account can write to the Nimbo state folder."
+remote_changed = "An item changed in Drive during the backup. Review the pending changes and run the backup again."
+remote_missing = "An item is no longer available in Drive. Check whether it was moved, sent to the trash, or its access changed."
+local_vanished = "A file disappeared from your computer during the backup. Check its location and try again."
+local_unreadable = "A file couldn't be read on your computer. Check its permissions and try again."
+file_in_use = "A file kept changing during the backup. Save your changes, close the file, and try again."
+move_rejected = "Google Drive rejected the move. Check folder permissions and try again."
+unreadable = "This item couldn't be read. Check its permissions on your computer."
+symlink = "The symbolic link was skipped. To back up its contents, select the original folder."
+special-file = "A special file was skipped. If you need its data, save it as a regular file."
+nfc-collision = "Two names match after normalization. Rename one of them and run the backup again."
+outside-scope = "The item is outside the selected folders. It was kept in your Drive."
+google-native-kept = "The Google document was kept in your Drive."
+protected-kept = "The item was kept in your Drive because it's protected."
+type-conflict-kept = "The item was kept in Drive because a file and a folder share its name. Rename one of them to resolve the conflict."
+duplicate-unmanaged = "A copy in Drive was kept because Nimbo doesn't manage it. Review both copies if you want to resolve the duplicate."
+folder-kept-protected = "The folder was kept in your Drive because it contains items that need to stay there."
+folder_ratio = "A large share of a folder's items would move to the trash in Drive. Review the list before confirming."
+too_many_deletes = "The plan exceeds the limit on items that can move to the trash without confirmation. Review the list before continuing."
+unsafe_restore_path = "The original location can't be used safely. Review the path before restoring."
+unsafe_restore_target = "Nimbo couldn't verify the restore destination. Check the original folder in your Drive."
+
+[result]
+ok = "Completed"
+partial = "Completed with pending changes"
+failed = "Failed"
+needs_confirmation = "Awaiting confirmation"
+skipped = "Skipped"
+cancelled = "Stopped"
+paused = "Paused"
+
+[notify.ok]
+title = "Backup complete"
+body = "{uploaded}, {updated}, and {trashed}."
+
+[notify.partial]
+title = "Some backup changes are still pending"
+body = "Check the history to see which changes are pending and run the backup again."
+
+[notify.failed]
+title = "Backup interrupted"
+body = "Check the history to see what happened before running the backup again."
+
+[notify.needs_confirmation]
+title = "Some items are ready to move to the trash"
+body = "Run backup now --confirmar to review the list and decide whether to continue."
+
+[notify.paused]
+title = "Backup paused"
+body = "Pending changes will resume with the next backup."
+
+[notify.skipped]
+title = "Backup skipped"
+body = "Run backup doctor to see what kept the backup from starting."
+
+[notify.uploaded]
+one = "{count} file uploaded"
+other = "{count} files uploaded"
+
+[notify.updated]
+one = "{count} file updated"
+other = "{count} files updated"
+
+[notify.trashed]
+one = "{count} item moved to the trash"
+other = "{count} items moved to the trash"
+
+[notify.incomplete]
+one = "{count} change is pending. Check the history and run the backup again."
+other = "{count} changes are pending. Check the history and run the backup again."
+
+[units]
+decimal_separator = "."
+seconds = "{seconds} s"
+minutes_seconds = "{minutes} min {seconds:02d} s"
+hours_minutes = "{hours} h {minutes:02d} min"
+days_hours = "{days} d {hours:02d} h"
+
+[time]
+today = "today, {time}"
+yesterday = "yesterday, {time}"
+same_year = "{month} {day}, {time}"
+other_year = "{month} {day}, {year}, {time}"
+
+[time.month]
+1 = "Jan"
+2 = "Feb"
+3 = "Mar"
+4 = "Apr"
+5 = "May"
+6 = "Jun"
+7 = "Jul"
+8 = "Aug"
+9 = "Sep"
+10 = "Oct"
+11 = "Nov"
+12 = "Dec"
+
+[phase]
+preflight = "Checking backup conditions"
+listing = "Checking your Drive"
+scanning = "Scanning folders on your computer"
+planning = "Preparing changes"
+mkdir = "Creating folders"
+move = "Moving items"
+transfer = "Uploading files"
+trash = "Moving items to the trash"
+finishing = "Finishing the backup"
+
+[cli]
+
+[tui]
+
+[wizard]
+
+[doctor]
+
+[common]
+unknown = "—"

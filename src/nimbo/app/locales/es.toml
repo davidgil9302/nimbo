@@ -1,0 +1,182 @@
+# Spanish is the reference catalog. Keep the English keys and placeholders in sync.
+
+[reason]
+ok = "El respaldo terminó."
+partial = "Algunos cambios quedaron pendientes. Revisa el historial y vuelve a respaldar."
+failed = "El respaldo se interrumpió por un error. Revisa el historial para saber qué pasó."
+needs_confirmation = "Hay elementos por enviar a la papelera. Revisa la lista y confirma si quieres continuar."
+skipped = "El respaldo se omitió. Revisa el estado para saber qué falta."
+cancelled = "El respaldo se detuvo. Puedes iniciarlo de nuevo cuando quieras."
+paused = "El respaldo quedó en pausa. Los cambios pendientes se retomarán en el próximo respaldo."
+new = "Nuevo en tu computadora"
+changed = "Cambió el contenido en tu computadora"
+metadata = "Cambió la fecha de modificación"
+renamed = "Cambió el nombre o la ubicación"
+adopted = "Ya hay una copia idéntica en tu Drive"
+deleted-locally = "Se eliminó de tu computadora"
+extraneous = "Ya no forma parte del respaldo"
+duplicate = "Hay otra copia en tu Drive"
+type-conflict = "Un archivo y una carpeta tienen el mismo nombre"
+invalid-name = "El nombre no se puede usar en el respaldo. Revisa el nombre antes de continuar."
+error = "Ocurrió un error durante el respaldo. Revisa el diagnóstico para saber qué hacer."
+config_invalid = "La configuración tiene datos inválidos. Revisa los ajustes o ejecuta backup instalar."
+already_running = "Ya hay un respaldo en curso. Espera a que termine."
+preflight_failed = "El respaldo no pudo empezar. Ejecuta backup diagnostico para revisar qué falta."
+secret_store_unavailable = "El almacén de claves no está disponible. Inicia sesión en tu escritorio y vuelve a intentarlo."
+secret_store_locked = "El almacén de claves está bloqueado. Desbloquéalo en tu escritorio y vuelve a intentarlo."
+auth_failed = "Nimbo no pudo iniciar sesión en Google. Ejecuta backup conectar para volver a vincular tu cuenta."
+reauth_required = "La autorización de Google dejó de ser válida. Ejecuta backup conectar para renovar el acceso a tu Drive."
+auth_denied = "No se concedió acceso a tu Drive. Ejecuta backup conectar y, si quieres continuar, concede el acceso en Google."
+auth_timeout = "Se agotó el tiempo para autorizar el acceso. Ejecuta backup conectar y completa el paso en el navegador."
+auth_scope_missing = "Google no concedió todos los permisos necesarios. Ejecuta backup conectar y acepta el permiso de Drive."
+auth_network = "Nimbo no pudo comunicarse con Google al conectar tu cuenta. Revisa tu conexión a internet y vuelve a intentarlo."
+drive_error = "Google Drive no pudo completar la operación. Revisa el historial y vuelve a intentarlo."
+network_failed = "Se perdió la comunicación con Google Drive. Revisa tu conexión a internet y vuelve a intentarlo."
+rate_limited = "Google Drive recibió demasiadas solicitudes. Espera unos minutos y vuelve a intentarlo."
+server_error = "Google Drive tuvo un problema temporal. Espera unos minutos y vuelve a intentarlo."
+unauthorized = "Google Drive rechazó la autorización. Ejecuta backup conectar para renovar el acceso."
+bad_request = "Google Drive rechazó la solicitud. Revisa el historial para identificar el elemento afectado."
+forbidden = "Tu cuenta no tiene permiso para completar la operación en Drive. Revisa los permisos de la carpeta de destino."
+not_found = "Google Drive no encontró el elemento. Revisa que siga en tu Drive y que tu cuenta tenga acceso."
+conflict = "Google Drive detectó un conflicto con un elemento existente. Revisa los cambios pendientes antes de reintentar."
+storage_quota_exceeded = "Se agotó el espacio de tu Drive. Libera espacio o amplía tu almacenamiento y vuelve a respaldar."
+upload_limit_exceeded = "Se alcanzó el límite diario de subidas de Google Drive. Los cambios pendientes se retomarán en el próximo respaldo."
+upload_session_expired = "La sesión de subida venció. Vuelve a respaldar para iniciar una nueva."
+file_changed = "El archivo cambió mientras se estaba leyendo. Guárdalo en tu computadora y vuelve a respaldar."
+md5_mismatch = "La copia en Drive no pasó la verificación de integridad. Vuelve a respaldar para intentarlo de nuevo."
+stopped = "El respaldo se detuvo. Puedes iniciarlo de nuevo cuando quieras."
+sentinel_missing = "Falta el marcador de la carpeta de origen. Conecta la unidad correcta y, si hace falta configurarla, ejecuta backup instalar."
+sentinel_mismatch = "El marcador no coincide con el origen configurado. Conecta la unidad que elegiste al instalar Nimbo."
+source_not_mounted = "La unidad de origen no está montada. Conéctala y ábrela en tu computadora antes de respaldar."
+source_missing = "No se encontró la carpeta de origen. Revisa la ruta en los ajustes y comprueba que esté disponible."
+folder_missing = "Falta una carpeta elegida para el respaldo. Revisa que siga en la carpeta de origen o ajusta la selección."
+folder_empty = "Una carpeta de origen está vacía. Revisa que sea la carpeta correcta y que sus archivos estén disponibles."
+folder_unreadable = "No se pudo leer una carpeta de origen. Revisa sus permisos en tu computadora."
+network_unavailable = "No hay conexión con Google Drive. Revisa tu conexión a internet y vuelve a respaldar."
+target_missing = "No se encontró la carpeta de destino en tu Drive. Comprueba que exista y que tu cuenta tenga acceso."
+storage_insufficient = "Tu Drive no tiene espacio suficiente para estos cambios. Libera espacio o amplía tu almacenamiento."
+internal_error = "Un error inesperado interrumpió el respaldo. Ejecuta backup diagnostico y revisa el historial antes de reintentar."
+plan_inconsistent = "El plan de respaldo contiene cambios incompatibles. Revisa los pendientes y vuelve a intentarlo."
+plan-inconsistent = "El plan de respaldo contiene cambios incompatibles. Revisa los pendientes y vuelve a intentarlo."
+foreign_owner = "El elemento pertenece a otro respaldo de Nimbo. Elige una carpeta de destino distinta."
+foreign-owner = "El elemento pertenece a otro respaldo de Nimbo. Elige una carpeta de destino distinta."
+db_too_new = "Una versión más reciente de Nimbo creó el índice local. Actualiza Nimbo para abrirlo."
+db_readonly = "El índice local es de solo lectura. Revisa que tu cuenta pueda escribir en la carpeta de estado de Nimbo."
+remote_changed = "Un elemento cambió en Drive durante el respaldo. Revisa los pendientes y vuelve a respaldar."
+remote_missing = "Un elemento ya no está disponible en Drive. Revisa si se movió, si está en la papelera o si cambió su acceso."
+local_vanished = "Un archivo desapareció de tu computadora durante el respaldo. Revisa su ubicación y vuelve a intentarlo."
+local_unreadable = "No se pudo leer un archivo en tu computadora. Revisa sus permisos y vuelve a intentarlo."
+file_in_use = "Un archivo seguía cambiando durante el respaldo. Guarda los cambios, cierra el archivo y vuelve a intentarlo."
+move_rejected = "Google Drive rechazó el movimiento. Revisa los permisos de las carpetas y vuelve a intentarlo."
+unreadable = "No se pudo leer este elemento. Revisa los permisos en tu computadora."
+symlink = "Se omitió el enlace simbólico. Si quieres respaldar su contenido, selecciona la carpeta original."
+special-file = "Se omitió un tipo de archivo especial. Si necesitas sus datos, guárdalos como un archivo normal."
+nfc-collision = "Dos nombres se ven iguales al normalizarlos. Cambia uno de los nombres y vuelve a respaldar."
+outside-scope = "El elemento está fuera de las carpetas elegidas. Se conservó en tu Drive."
+google-native-kept = "El documento de Google se conservó en tu Drive."
+protected-kept = "Se conservó el elemento en tu Drive porque está protegido."
+type-conflict-kept = "Se conservó el elemento en Drive porque un archivo y una carpeta comparten nombre. Cambia uno de los nombres si quieres resolver el conflicto."
+duplicate-unmanaged = "Se conservó una copia de Drive que no administra Nimbo. Revisa ambas copias si quieres resolver el duplicado."
+folder-kept-protected = "La carpeta se conservó en tu Drive porque contiene elementos que deben quedarse allí."
+folder_ratio = "Una carpeta perdería gran parte de sus elementos en Drive. Revisa la lista de elementos antes de confirmar."
+too_many_deletes = "El plan supera el límite de elementos que se pueden enviar a la papelera sin confirmación. Revisa la lista antes de continuar."
+unsafe_restore_path = "La ubicación original no se puede usar de forma segura. Revisa la ruta antes de restaurar."
+unsafe_restore_target = "Nimbo no pudo verificar el destino de la restauración. Revisa la carpeta original en tu Drive."
+
+[result]
+ok = "Completado"
+partial = "Completado con pendientes"
+failed = "Falló"
+needs_confirmation = "Pendiente de confirmación"
+skipped = "Omitido"
+cancelled = "Detenido"
+paused = "En pausa"
+
+[notify.ok]
+title = "Respaldo completado"
+body = "{uploaded}, {updated} y {trashed}."
+
+[notify.partial]
+title = "El respaldo dejó cambios pendientes"
+body = "Revisa el historial para ver qué cambios faltan y vuelve a respaldar."
+
+[notify.failed]
+title = "El respaldo se interrumpió"
+body = "Revisa el historial para saber qué pasó antes de volver a respaldar."
+
+[notify.needs_confirmation]
+title = "Hay elementos por enviar a la papelera"
+body = "Ejecuta backup ahora --confirmar para revisar la lista y decidir si quieres continuar."
+
+[notify.paused]
+title = "Respaldo en pausa"
+body = "Los cambios pendientes se retomarán en el próximo respaldo."
+
+[notify.skipped]
+title = "Se omitió el respaldo"
+body = "Ejecuta backup diagnostico para revisar qué impidió que comenzara."
+
+[notify.uploaded]
+one = "{count} archivo subido"
+other = "{count} archivos subidos"
+
+[notify.updated]
+one = "{count} archivo actualizado"
+other = "{count} archivos actualizados"
+
+[notify.trashed]
+one = "{count} elemento en la papelera"
+other = "{count} elementos en la papelera"
+
+[notify.incomplete]
+one = "Quedó {count} cambio pendiente. Revisa el historial y vuelve a respaldar."
+other = "Quedaron {count} cambios pendientes. Revisa el historial y vuelve a respaldar."
+
+[units]
+decimal_separator = ","
+seconds = "{seconds} s"
+minutes_seconds = "{minutes} min {seconds:02d} s"
+hours_minutes = "{hours} h {minutes:02d} min"
+days_hours = "{days} d {hours:02d} h"
+
+[time]
+today = "hoy, {time}"
+yesterday = "ayer, {time}"
+same_year = "{day} {month}, {time}"
+other_year = "{day} {month} {year}, {time}"
+
+[time.month]
+1 = "ene"
+2 = "feb"
+3 = "mar"
+4 = "abr"
+5 = "may"
+6 = "jun"
+7 = "jul"
+8 = "ago"
+9 = "sep"
+10 = "oct"
+11 = "nov"
+12 = "dic"
+
+[phase]
+preflight = "Revisando las condiciones del respaldo"
+listing = "Consultando tu Drive"
+scanning = "Leyendo las carpetas de tu computadora"
+planning = "Preparando los cambios"
+mkdir = "Creando carpetas"
+move = "Moviendo elementos"
+transfer = "Subiendo archivos"
+trash = "Enviando elementos a la papelera"
+finishing = "Terminando el respaldo"
+
+[cli]
+
+[tui]
+
+[wizard]
+
+[doctor]
+
+[common]
+unknown = "—"

@@ -27,7 +27,7 @@ def apply_plan(
     root_id: str,
     root_uuid: str,
 ) -> dict[str, RemoteFile]:
-    """Return a copy with the plan applied in order, asserting valid Drive parents and IDs."""
+    """Apply the plan to a copy, validating parents and IDs without modeling a server clock."""
     result = dict(files)
     folders = dict(plan.folder_ids)
     children: dict[str, set[str]] = defaultdict(set)
@@ -76,7 +76,7 @@ def apply_plan(
                 (parent,),
                 None if is_dir else local[op.rel].size,
                 digest,
-                drive_ms(op.mtime_ns),
+                None if is_dir else drive_ms(op.mtime_ns),
                 {OWNER_PROPERTY: root_uuid},
             )
             children[parent].add(file_id)
@@ -97,7 +97,7 @@ def apply_plan(
                 item,
                 name=op.name,
                 parents=(parent,),
-                modified_ms=drive_ms(op.mtime_ns) if op.mtime_ns else item.modified_ms,
+                modified_ms=item.modified_ms if item.is_folder else drive_ms(op.mtime_ns),
                 properties=props,
             )
         elif op.kind is OpKind.UPDATE:

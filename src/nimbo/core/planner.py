@@ -375,7 +375,7 @@ def _file_moves(
     trash: dict[str, str],
     md5_of: Callable[[LocalEntry], str | None],
     owner: str,
-) -> tuple[list[Op], list[Op]]:
+) -> list[Op]:
     groups: dict[tuple[int, str], _FileMatches] = defaultdict(_FileMatches)
     sizes: Counter[int] = Counter()
     for candidate in sorted(trash, key=lambda item: (remote.rels[item], item)):
@@ -395,7 +395,6 @@ def _file_moves(
         sizes[item.size] += 1
 
     moves = []
-    touches = []
     for rel in sorted(local):
         entry = local[rel]
         if entry.is_dir or rel in pairs or not sizes[entry.size]:
@@ -411,14 +410,10 @@ def _file_moves(
         move.md5 = md5
         move.mtime_ns = entry.mtime_ns
         moves.append(move)
-        item = remote.items[file_id]
-        # The executor interprets zero in a MOVE as "keep modifiedTime".
-        if entry.mtime_ns == 0 and item.modified_ms != 0:
-            touches.append(Op(OpKind.TOUCH, rel, "metadata", file_id=file_id, md5=md5))
-        pairs[rel] = item
+        pairs[rel] = remote.items[file_id]
         trash.pop(file_id)
         sizes[entry.size] -= 1
-    return moves, touches
+    return moves
 
 
 def _trash_ops(
@@ -549,6 +544,9 @@ def make_plan(
     current bytes or return None if unavailable. Read it lazily and cache both
     results for this plan. A foreign owner or missing destination parent yields
     an error plan with no operations. Callback errors propagate to the caller.
+
+    File writes carry the local mtime in nanoseconds. Folder operations and
+    trash carry zero.
     """
     folders = set(options.folders)
     protected = set(options.protected)
@@ -578,10 +576,11 @@ def make_plan(
     )
     pairs, trash = _pair(remote, entries, options.root_uuid, md5_of, plan.warnings)
     folder_moves, relocated = _folder_moves(remote, entries, pairs, trash, options.root_uuid)
-    file_moves, contents = _file_moves(remote, entries, pairs, trash, md5_of, options.root_uuid)
+    file_moves = _file_moves(remote, entries, pairs, trash, md5_of, options.root_uuid)
     trashes = _trash_ops(remote, trash, entries, plan.warnings)
     moved_files = {op.rel for op in file_moves}
     mkdirs = []
+    contents = []
     for rel, entry in entries.items():
         item = pairs.get(rel)
         if item is not None and item.is_folder == entry.is_dir:

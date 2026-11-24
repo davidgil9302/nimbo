@@ -15,6 +15,7 @@ from nimbo.core.model import (
     SHORTCUT_MIME,
     LocalEntry,
     RemoteFile,
+    drive_ms,
     is_under,
     nfc,
     rel_depth,
@@ -30,12 +31,13 @@ MATCHER = Matcher(("*.skip", "cache/"))
 RENAME_NAMES = ("year one", "café", "cafe\u0301", "moon🌙", ".v2", "tab\tline\n")
 NAMES = (*RENAME_NAMES, "x", "notes.txt", "file name.txt", "空 白", "naïve.jpeg")
 NS = 1_000_000
+_EDGE_MTIMES_NS = (0, -2 * NS, -1, 1, NS - 1)
 
 
 @dataclass(frozen=True)
 class _Node:
     data: bytes | None
-    ms: int
+    mtime_ns: int
     raw_name: str
 
     @property
@@ -79,20 +81,27 @@ def _fresh(paths: Iterable[str], parent: str, raw_name: str) -> tuple[str, str]:
     return rel, raw_name
 
 
+def _file_mtime_ns(selector: int) -> int:
+    if selector < len(_EDGE_MTIMES_NS):
+        return _EDGE_MTIMES_NS[selector]
+    return selector * NS + selector
+
+
 def _seed(rows: list[tuple[int, int, int]]) -> dict[str, _Node]:
-    result = {folder: _Node(None, 10, folder) for folder in FOLDERS}
-    result["Projects/Old folder"] = _Node(None, 11, "Old folder")
-    result["Projects/Old folder/café"] = _Node(b"abc", 11, "cafe\u0301")
-    result["Projects/Old folder/.photo 🌙"] = _Node(b"o", 12, ".photo 🌙")
+    result = {folder: _Node(None, 10 * NS, folder) for folder in FOLDERS}
+    result["Projects/Old folder"] = _Node(None, 11 * NS, "Old folder")
+    result["Projects/Old folder/café"] = _Node(b"abc", 11 * NS, "cafe\u0301")
+    result["Projects/Old folder/.photo 🌙"] = _Node(b"o", 12 * NS, ".photo 🌙")
     result["Photos/year one.txt"] = _Node(b"11", 0, "year one.txt")
-    result["Photos/.empty"] = _Node(b"", 13, ".empty")
+    result["Photos/.empty"] = _Node(b"", 13 * NS, ".empty")
     for parent_selector, name_selector, material in rows:
         parents = [rel for rel, node in result.items() if node.is_dir and rel_depth(rel) < 4]
         parent = _pick(parents, parent_selector)
         rel, raw = _fresh(result, parent, _pick(list(NAMES), name_selector))
         size = material % 7
         data = None if material % 4 == 0 else bytes([material % 5]) * size
-        result[rel] = _Node(data, material % 50, raw)
+        mtime_ns = material * NS if data is None else _file_mtime_ns(material)
+        result[rel] = _Node(data, mtime_ns, raw)
     return result
 
 
@@ -110,7 +119,7 @@ def _local_snapshot(tree: dict[str, _Node]) -> tuple[dict[str, LocalEntry], dict
         disk = _disk_rel(tree, rel)
         data = node.data
         entries[rel] = LocalEntry(
-            rel, data is None, len(data or b""), node.ms * NS, disk if disk != rel else None
+            rel, data is None, len(data or b""), node.mtime_ns, disk if disk != rel else None
         )
         if data is not None:
             content[rel] = data
@@ -135,7 +144,7 @@ def _remote_file(file_id: str, node: _Node, parent: str) -> RemoteFile:
         (parent,),
         None if data is None else len(data),
         None if data is None else _md5(data),
-        node.ms,
+        drive_ms(node.mtime_ns),
         {OWNER_PROPERTY: OWNER},
     )
 
@@ -178,7 +187,11 @@ def _mutate_local(tree: dict[str, _Node], kind: str, index: int, extra: int) -> 
     files = [rel for rel in nested if not tree[rel].is_dir]
     if kind in ("add-file", "add-dir"):
         rel, raw = _fresh(tree, _pick(parents, index), _pick(list(NAMES), extra))
-        tree[rel] = _Node(None if kind == "add-dir" else bytes([index]), extra, raw)
+        tree[rel] = (
+            _Node(None, extra * NS, raw)
+            if kind == "add-dir"
+            else _Node(bytes([index]), _file_mtime_ns(extra), raw)
+        )
     elif kind in ("delete", "replace-type") and nested:
         src = _pick(nested, index)
         old = tree[src]
@@ -191,12 +204,16 @@ def _mutate_local(tree: dict[str, _Node], kind: str, index: int, extra: int) -> 
         rel = _pick(files, index)
         old = tree[rel]
         assert old.data is not None
+        if kind == "touch":
+            tree[rel] = replace(old, mtime_ns=_file_mtime_ns(extra))
+            return
         data = old.data
         if kind == "edit-size" or (kind == "edit-same-size" and not data):
             data += bytes([extra])
-        elif kind != "touch" and data:
+        elif data:
             data = bytes([data[0] ^ 1]) + data[1:]
-        tree[rel] = replace(old, data=data, ms=old.ms + (kind != "silent-edit"))
+        mtime_ns = old.mtime_ns if kind == "silent-edit" else old.mtime_ns + NS
+        tree[rel] = replace(old, data=data, mtime_ns=mtime_ns)
     elif kind in ("rename-file", "move-file", "rename-dir", "move-dir"):
         candidates = files if kind.endswith("file") else [rel for rel in dirs if rel in nested]
         if not candidates:
@@ -246,7 +263,7 @@ def _mutate_remote(
         for rel, old in previous.items():
             current = local.get(rel)
             if kind == "dupe-folder":
-                if old.is_dir and rel not in FOLDERS and old.ms > 0:
+                if old.is_dir and rel not in FOLDERS and old.mtime_ns > 0:
                     candidates.append(rel)
             elif kind == "nfd":
                 if nfc(rel_name(rel)) != normalize("NFD", rel_name(rel)):
@@ -272,8 +289,8 @@ def _mutate_remote(
                 properties={} if kind == "unmanaged-dupe" else {OWNER_PROPERTY: OWNER},
             )
     elif kind == "outside":
-        remote[fresh] = _remote_file(fresh, _Node(None, 3, f"Outside {serial}"), ROOT)
-        remote[f"{fresh}-item"] = _remote_file(f"{fresh}-item", _Node(b"x", 4, "保留"), fresh)
+        remote[fresh] = _remote_file(fresh, _Node(None, 3 * NS, f"Outside {serial}"), ROOT)
+        remote[f"{fresh}-item"] = _remote_file(f"{fresh}-item", _Node(b"x", 4 * NS, "保留"), fresh)
     elif kind == "native":
         remote[fresh] = RemoteFile(
             fresh,
@@ -285,12 +302,12 @@ def _mutate_remote(
         name = f"Remote folder {serial}" + (".skip" if kind == "excluded" else "")
         if kind == "protected":
             protected.add(rel_join(parent_rel, name))
-        remote[fresh] = _remote_file(fresh, _Node(None, 4, name), parent)
+        remote[fresh] = _remote_file(fresh, _Node(None, 4 * NS, name), parent)
         child = f"{fresh}-item"
-        remote[child] = _remote_file(child, _Node(b"xyz", 5, "extra"), fresh)
+        remote[child] = _remote_file(child, _Node(b"xyz", 5 * NS, "extra"), fresh)
     else:
         name = f"bad/{serial}" if kind == "invalid" else f"Extra {serial} 📎"
-        remote[fresh] = _remote_file(fresh, _Node(b"extra", 5, name), parent)
+        remote[fresh] = _remote_file(fresh, _Node(b"extra", 5 * NS, name), parent)
 
 
 @st.composite

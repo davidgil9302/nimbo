@@ -216,6 +216,44 @@ def test_load_tree_matches_inserted(db: Index) -> None:
     assert db.remote_count() == len(files)
 
 
+def test_in_subtree_follows_live_parent_chain_to_root(db: Index) -> None:
+    db.upsert_remote(
+        [
+            _file("root", "above", folder=True),
+            _file("above", folder=True),
+            _file("folder", "root", folder=True),
+            _file("file", "folder"),
+            _file("other", "above"),
+            RemoteFile("trash", "Trash", FOLDER_MIME, ("root",), trashed=True),
+            _file("under-trash", "trash"),
+        ]
+    )
+
+    assert db.in_subtree("root", "root")
+    assert db.in_subtree("folder", "root")
+    assert db.in_subtree("file", "root")
+    assert not db.in_subtree("above", "root")
+    assert not db.in_subtree("other", "root")
+    assert not db.in_subtree("trash", "root")
+    assert not db.in_subtree("under-trash", "root")
+
+
+def test_in_subtree_rejects_unknown_missing_and_cyclic_ancestry(db: Index) -> None:
+    db.upsert_remote(
+        [
+            _file("child", "missing"),
+            _file("one", "two", folder=True),
+            _file("two", "one", folder=True),
+            _file("self", "self", folder=True),
+        ]
+    )
+
+    assert db.in_subtree("root", "root")
+    assert all(
+        not db.in_subtree(file_id, "root") for file_id in ("unknown", "child", "one", "two", "self")
+    )
+
+
 _TEXT = st.text(max_size=15)
 _INT = st.integers(min_value=-(2**63), max_value=2**63 - 1)
 

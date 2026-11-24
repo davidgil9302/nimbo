@@ -70,7 +70,17 @@ def _ancestors_of_untouchables(case: Scenario, before: RemoteTree) -> set[str]:
 def test_apply_converges_to_mirror(case: Scenario) -> None:
     """The eligible snapshot matches the local bytes, sizes, timestamps and paths."""
     plan = _plan(case)
-    after = RemoteTree(ROOT, _apply(case, plan).values())
+    applied = _apply(case, plan)
+    for op in plan.ops:
+        if op.kind is OpKind.TRASH:
+            assert op.mtime_ns == 0
+        else:
+            entry = case.local[op.rel]
+            assert op.mtime_ns == (0 if entry.is_dir else entry.mtime_ns)
+            if op.kind is OpKind.MOVE and entry.is_dir:
+                assert op.file_id is not None
+                assert applied[op.file_id].modified_ms == case.remote[op.file_id].modified_ms
+    after = RemoteTree(ROOT, applied.values())
     desired = {
         rel: entry
         for rel, entry in expected_view(case.local, MATCHER, FOLDERS).items()

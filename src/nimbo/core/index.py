@@ -326,6 +326,30 @@ class Index:
             row = self._execute("SELECT * FROM remote WHERE id = ?", (file_id,)).fetchone()
             return None if row is None else _remote_row(row)
 
+    def in_subtree(self, file_id: str, root_id: str) -> bool:
+        """Return whether a live row reaches the given root through indexed parents.
+
+        The root identifies itself. Missing rows or cycles before reaching it
+        do not establish membership.
+        """
+        if file_id == root_id:
+            return True
+        with self._transaction():
+            row = self._execute(
+                """
+                WITH RECURSIVE ancestors(id, parent_id) AS (
+                    SELECT id, parent_id FROM remote WHERE id = ? AND trashed = 0
+                    UNION
+                    SELECT parent.id, parent.parent_id
+                    FROM remote AS parent JOIN ancestors AS child ON parent.id = child.parent_id
+                    WHERE child.id <> ? AND parent.trashed = 0
+                )
+                SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = ?)
+                """,
+                (file_id, root_id, root_id),
+            ).fetchone()
+            return bool(row[0])
+
     def load_tree(self, root_id: str) -> RemoteTree:
         """Build a tree rooted at ``root_id`` from a consistent mirror snapshot."""
         with self._transaction():

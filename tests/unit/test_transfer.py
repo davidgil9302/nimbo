@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from nimbo.core.errors import Conflict, FileChanged, Md5Mismatch, ServerError, S
 from nimbo.core.index import Index
 from nimbo.core.model import EMPTY_MD5, PART_SUFFIX, drive_ms
 from nimbo.core.ratelimit import RateLimiter, RetryPolicy
-from nimbo.core.transfer import Downloader, Uploader, UploadRequest
+from nimbo.core.transfer import Downloader, Uploader, UploadRequest, create_session_kind
 from tests.fakedrive import FakeDrive, Fault, FaultPlan, SimulatedCrash
 
 _CHUNK = 262144
@@ -73,9 +74,9 @@ class _Harness:
 
     def session(self, req: UploadRequest) -> tuple[str, str] | None:
         """Get the saved record for a request."""
-        return self.index.get_session(
-            req.rel, req.size, req.mtime_ns, "update" if req.update else "create"
-        )
+        assert req.update or req.parent_id is not None
+        kind = "update" if req.update else create_session_kind(req.parent_id)
+        return self.index.get_session(req.rel, req.size, req.mtime_ns, kind)
 
     def use_new_index(self) -> None:
         """Reopen the on-disk index to simulate a later process."""
@@ -260,30 +261,80 @@ def test_create_conflict_after_completion_is_success(remote: _Harness, data: byt
 
 
 @pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
-def test_create_conflict_with_different_content_stays_conflict(
+def test_create_existing_with_wrong_content_switches_to_update(
     remote: _Harness, data: bytes
 ) -> None:
-    """Refuse to treat an unrelated or changed file ID as a completed create."""
+    """Repair same-size corruption found after the reserved ID returns HTTP 409."""
     req = remote.request(data)
     remote.uploader().upload(req)
-    remote.fake.set_content(req.file_id, b"X" + data[1:])
-    with pytest.raises(Conflict):
-        remote.uploader().upload(req)
-    assert remote.fake.file(req.file_id).content == b"X" + data[1:]
+    remote.fake.set_content(req.file_id, b"X" + data[1:], keep_modified=True)
+    corrupted = remote.fake.file(req.file_id)
+    assert (corrupted.size, corrupted.modified_ms) == (req.size, drive_ms(req.mtime_ns))
+
+    remote.fake.calls.clear()
+    deltas: list[int] = []
+    result = remote.uploader().upload(req, on_bytes=deltas.append)
+
+    assert result.file.id == req.file_id
+    assert result.file.md5 == result.local_md5 == hashlib.md5(data).hexdigest()
+    assert remote.fake.file(req.file_id).content == data
+    assert [item.id for item in remote.fake.find(remote.fake.root_id, req.rel)] == [req.file_id]
+    assert [(call.method, call.status) for call in remote.fake.calls[:3]] == [
+        ("POST", 409),
+        ("GET", 200),
+        ("PATCH", 200),
+    ]
+    assert sum(deltas) == req.size
+    assert remote.session(req) is None and remote.session(replace(req, update=True)) is None
 
 
 @pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
-def test_md5_mismatch_raises(remote: _Harness, data: bytes) -> None:
-    """Reject mismatching bytes returned for an otherwise completed upload."""
+@pytest.mark.parametrize("foreign", ["folder", "name", "parent"])
+def test_existing_object_not_ours_still_conflicts(
+    remote: _Harness, data: bytes, foreign: str
+) -> None:
+    """Leave a reserved ID with a different type, parent or name untouched."""
     req = remote.request(data)
+    if foreign == "folder":
+        remote.drive.create_folder(
+            file_id=req.file_id, name=req.rel, parent_id=remote.fake.root_id, properties={}
+        )
+    elif foreign == "name":
+        remote.uploader().upload(replace(req, name="another"))
+    else:
+        parent = remote.fake.add_folder("another")
+        remote.uploader().upload(replace(req, parent_id=parent))
+    existing = remote.fake.file(req.file_id)
+    remote.fake.calls.clear()
+
+    with pytest.raises(Conflict) as error:
+        remote.uploader().upload(req)
+
+    assert error.value.status == 409
+    assert remote.fake.file(req.file_id) == existing
+    assert [(call.method, call.status) for call in remote.fake.calls] == [
+        ("POST", 409),
+        ("GET", 200),
+    ]
+
+
+@contextmanager
+def _corrupt_uploads(
+    remote: _Harness, req: UploadRequest, data: bytes, *, count: int
+) -> Iterator[Uploader]:
     original = remote.fake.transport()
 
     def corrupt_response(request: httpx.Request) -> httpx.Response:
+        nonlocal count
         response = original.handle_request(request)
-        if response.status_code == 200 and (
-            _final_put(request) or request.url.params.get("uploadType") == "multipart"
+        if (
+            count
+            and response.status_code == 200
+            and (_final_put(request) or request.url.params.get("uploadType") == "multipart")
         ):
-            remote.fake.set_content(req.file_id, b"X" + data[1:])
+            assert response.json()["id"] == req.file_id
+            count -= 1
+            remote.fake.set_content(req.file_id, b"X" + data[1:], keep_modified=True)
             item = remote.fake.file(req.file_id)
             return httpx.Response(200, json=item.as_api())
         return response
@@ -296,9 +347,99 @@ def test_md5_mismatch_raises(remote: _Harness, data: bytes) -> None:
             RetryPolicy(max_attempts=1),
             sleep=lambda _: pytest.fail("unexpected retry"),
         )
-        with pytest.raises(Md5Mismatch):
-            Uploader(drive, remote.index, chunk_size=_CHUNK, multipart_max=_CHUNK).upload(req)
+        yield Uploader(drive, remote.index, chunk_size=_CHUNK, multipart_max=_CHUNK)
+
+
+@pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
+def test_md5_mismatch_on_create_converges_on_same_id(remote: _Harness, data: bytes) -> None:
+    """Repair corrupted bytes returned after a successful create on the same ID."""
+    req = remote.request(data)
+    deltas: list[int] = []
+    with _corrupt_uploads(remote, req, data, count=1) as uploader:
+        result = uploader.upload(req, on_bytes=deltas.append)
+    assert result.file.id == req.file_id and result.bytes_sent == 2 * req.size
+    assert result.file.md5 == result.local_md5 == hashlib.md5(data).hexdigest()
+    assert remote.fake.file(req.file_id).content == data
+    assert [item.id for item in remote.fake.find(remote.fake.root_id, req.rel)] == [req.file_id]
+    assert sum(deltas) == req.size
+    assert [call.method for call in remote.fake.calls if call.method in {"POST", "PATCH"}] == [
+        "POST",
+        "PATCH",
+    ]
+
+
+@pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
+def test_update_mismatch_retries_once(remote: _Harness, data: bytes) -> None:
+    """Retry a corrupt update in place even without a preceding create."""
+    req = remote.request(data, update=True)
+    with _corrupt_uploads(remote, req, data, count=1) as uploader:
+        result = uploader.upload(req)
+    assert result.file.id == req.file_id and result.bytes_sent == 2 * req.size
+    assert remote.fake.file(req.file_id).content == data
+    assert [call.method for call in remote.fake.calls if call.method == "PATCH"] == ["PATCH"] * 2
     assert remote.session(req) is None
+
+
+@pytest.mark.parametrize("data", [b"small", _LARGE], ids=["multipart", "resumable"])
+@pytest.mark.parametrize("update", [False, True], ids=["create", "update"])
+def test_md5_mismatch_raises(remote: _Harness, data: bytes, update: bool) -> None:
+    """Raise after two mismatches and keep exactly one object."""
+    req = remote.request(data, update=update)
+    with _corrupt_uploads(remote, req, data, count=2) as uploader, pytest.raises(Md5Mismatch):
+        uploader.upload(req)
+    assert [call.method for call in remote.fake.calls if call.method in {"POST", "PATCH"}] == [
+        "PATCH" if update else "POST",
+        "PATCH",
+    ]
+    assert [item.id for item in remote.fake.find(remote.fake.root_id, req.rel)] == [req.file_id]
+    assert remote.session(req) is None and remote.session(replace(req, update=True)) is None
+
+
+def test_resume_interrupted_create_repair(remote: _Harness) -> None:
+    """Resume the update session created by a prior call with the original create request."""
+    req = remote.request()
+    remote.uploader().upload(req)
+    remote.fake.set_content(req.file_id, b"X" + _LARGE[1:], keep_modified=True)
+    remote.fake.faults.add(
+        Fault(
+            lambda request: _data_put(request) and request.url.path.endswith("/" + req.file_id),
+            "crash_after",
+        )
+    )
+    with pytest.raises(SimulatedCrash):
+        remote.uploader().upload(req)
+    repair = replace(req, update=True)
+    assert remote.session(req) is None and remote.session(repair) is not None
+
+    remote.use_new_index()
+    result = remote.uploader().upload(req)
+    assert result.bytes_sent == req.size - _CHUNK
+    assert remote.fake.file(req.file_id).content == _LARGE
+    assert remote.session(repair) is None
+    assert len([call for call in remote.fake.calls if call.method == "PATCH"]) == 1
+
+
+def test_create_session_with_different_parent_is_not_resumed(remote: _Harness) -> None:
+    req = remote.request()
+    remote.fake.faults.add(Fault(_data_put, "crash_after"))
+    with pytest.raises(SimulatedCrash):
+        remote.uploader().upload(req)
+    old_session = remote.session(req)
+    assert old_session is not None
+    dest = remote.fake.add_folder("New parent")
+    replacement = replace(req, parent_id=dest, file_id=remote.drive.generate_ids(1)[0])
+    remote.fake.calls.clear()
+
+    result = remote.uploader().upload(replacement)
+
+    assert result.file.parents == (dest,)
+    assert result.file.id == replacement.file_id
+    assert remote.session(req) == old_session and remote.session(replacement) is None
+    assert not remote.fake.find(remote.fake.root_id, req.rel)
+    assert all(
+        call.query.get("upload_id") != httpx.URL(old_session[1]).params["upload_id"]
+        for call in remote.fake.calls
+    )
 
 
 def test_file_changed_before_upload(remote: _Harness) -> None:

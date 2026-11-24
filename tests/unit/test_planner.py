@@ -15,6 +15,7 @@ from nimbo.core.model import (
     Plan,
     PlanIssue,
     RemoteFile,
+    drive_ms,
 )
 from nimbo.core.planner import PlannerOptions, make_plan
 from nimbo.core.tree import RemoteTree
@@ -433,10 +434,61 @@ def test_zero_byte_files_never_move_matched():
     ]
 
 
-def test_epoch_file_move_repairs_mtime_in_content_phase():
-    plan = _plan([_entry("new", ms=0)], [_remote("a", "old")])
-    assert _ops(plan) == [(OpKind.MOVE, "Projects/new", "a"), (OpKind.TOUCH, "Projects/new", "a")]
-    assert all(op.mtime_ns == 0 for op in plan.ops)
+def test_epoch_file_move_converges_without_touch() -> None:
+    """A file MOVE sets the epoch directly and keeps the original ID."""
+    entry = _entry("new", ms=0)
+    remote = _remote("a", "old")
+    plan = _plan([entry], [remote])
+    assert _ops(plan) == [(OpKind.MOVE, "Projects/new", "a")]
+    assert plan.ops[0].mtime_ns == 0
+
+    local = {item.rel: item for item in (LOCAL_TOP, entry)}
+    files = {item.id: item for item in (TOP, remote)}
+    after = apply_plan(files, plan, local, lambda rel: "same", ROOT, OWNER)
+    assert after["a"].modified_ms == 0
+    assert _plan([entry], after.values(), top=False, deep=True).is_empty
+
+
+def test_epoch_dated_file_touch_converges() -> None:
+    """A TOUCH to the epoch applies once when the bytes already match."""
+    entry = _entry("a", ms=0)
+    remote = _remote("a", "a")
+    plan = _plan([entry], [remote])
+    assert _ops(plan) == [(OpKind.TOUCH, "Projects/a", "a")]
+    assert plan.ops[0].mtime_ns == 0
+
+    local = {item.rel: item for item in (LOCAL_TOP, entry)}
+    files = {item.id: item for item in (TOP, remote)}
+    after = apply_plan(files, plan, local, lambda rel: "same", ROOT, OWNER)
+    assert after["a"].modified_ms == 0
+    assert _plan([entry], after.values(), top=False, deep=True).is_empty
+
+
+@pytest.mark.parametrize("mtime_ns", [0, -1_234_567, 999_999, 7_123_456])
+def test_file_ops_always_carry_local_mtime(mtime_ns: int) -> None:
+    """Every kind of file write carries the unrounded local nanoseconds."""
+    entries = [
+        replace(_entry(name, size=size), mtime_ns=mtime_ns)
+        for name, size in (("upload", 31), ("update", 7), ("touch", 3), ("adopt", 3), ("move", 17))
+    ]
+    plan = _plan(
+        entries,
+        [
+            _remote("update", "update"),
+            _remote("touch", "touch"),
+            _remote("adopt", "adopt", ms=drive_ms(mtime_ns), owner=None),
+            _remote("old", "old", size=17),
+        ],
+    )
+    assert len(plan.ops) == len(entries)
+    assert {op.rel: op.kind for op in plan.ops} == {
+        "Projects/upload": OpKind.UPLOAD,
+        "Projects/update": OpKind.UPDATE,
+        "Projects/touch": OpKind.TOUCH,
+        "Projects/adopt": OpKind.ADOPT,
+        "Projects/move": OpKind.MOVE,
+    }
+    assert all(op.mtime_ns == mtime_ns for op in plan.ops)
 
 
 def test_duplicates_managed_trashed_unmanaged_reported():
