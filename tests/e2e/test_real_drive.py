@@ -62,6 +62,12 @@ def _assert_mirror(case: DriveCase, *, ignored: Collection[str] = ()) -> dict[st
     return items
 
 
+def _settled_state(item: RemoteFile) -> tuple[object, ...]:
+    # Google Docs update their size and modifiedTime after creation, so compare only
+    # what the tests wrote: placement, name, type and, for binaries, the content checksum.
+    return (item.name, item.parents, item.trashed, item.mime_type, item.md5)
+
+
 def _wait_for_drive_changes(case: DriveCase, start_cursor: str, *items: RemoteFile) -> None:
     """Re-read from before the writes until the feed shows each expected file state."""
     expected = {item.id: item for item in items}
@@ -77,7 +83,13 @@ def _wait_for_drive_changes(case: DriveCase, start_cursor: str, *items: RemoteFi
             page = case.drive.changes(cursor)
             for change in page.changes:
                 item = change.file
-                if not change.removed and item is not None and item == pending.get(change.file_id):
+                wanted = pending.get(change.file_id)
+                if (
+                    not change.removed
+                    and item is not None
+                    and wanted is not None
+                    and _settled_state(item) == _settled_state(wanted)
+                ):
                     del pending[change.file_id]
             if not pending:
                 return

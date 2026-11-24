@@ -30,6 +30,7 @@ from nimbo.core.errors import ConfigError
 from nimbo.core.model import RemoteFile, RunResult, RunSummary
 from nimbo.core.paths import Paths
 from nimbo.core.safety import write_sentinel
+from nimbo.core.secrets import SecretStore
 
 DOC_MIME = "application/vnd.google-apps.document"
 FOLDERS = ("Projects",)
@@ -50,6 +51,7 @@ class _Sandbox:
     drive: DriveClient
     config: Config
     folder_id: str
+    profile_dir: Path
 
     def check_parent(self, parent_id: str) -> None:
         """Require a live folder in the sandbox and outside the configured target."""
@@ -89,10 +91,11 @@ def drive_sandbox() -> Iterator[_Sandbox]:
 
     hooks = context.TestHooks()
     with context.new_http_client() as http:
-        store = context.secret_store(hooks, Paths.default().config_dir)
+        profile_dir = Paths.default().config_dir
+        store = context.secret_store(hooks, profile_dir)
         tokens = context.token_provider(config.oauth, store, http, hooks)
         drive = context.make_drive(http, tokens, TransferConfig(), hooks)
-        sandbox = _Sandbox(drive, config, folder_id)
+        sandbox = _Sandbox(drive, config, folder_id, profile_dir)
         sandbox.check_parent(folder_id)
         yield sandbox
 
@@ -200,8 +203,18 @@ class DriveCase:
                 client.event_hooks["response"].append(traffic.response)
             return client
 
+        secret_store = context.secret_store
+        profile_dir = self.sandbox.profile_dir
+
+        def saved_profile_store(
+            hooks: context.TestHooks, config_dir: Path | None = None
+        ) -> SecretStore:
+            # Each case keeps its own config and state, but signs in with the saved profile.
+            return secret_store(hooks, profile_dir)
+
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(context, "new_http_client", observe_client)
+            patch.setattr(context, "secret_store", saved_profile_store)
             engine, close = context.build_engine(
                 self.paths, self.config, env={}, notifier=_QuietNotifier()
             )
