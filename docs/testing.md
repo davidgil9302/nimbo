@@ -66,18 +66,25 @@ pytest tests/tui
 
 ## Real Drive tests
 
-The `e2e` marker selects tests that can talk to Google Drive. The default
-pytest selection and CI exclude it. The
-[runner](../scripts/e2e_soak.sh) repeats the real-Drive suite the number of times
-you give it and prints a summary.
-
-When the suite is available, configure a dedicated disposable Drive folder and
-the test account's authorized credentials in the local keyring. Replace the
-placeholder with the sandbox folder ID before running the script. Live tests
-may create and trash files in that folder.
+The `e2e` marker selects tests against Google Drive. The default pytest
+selection and CI exclude them. Use a saved `backup` configuration with an
+authorized refresh token in the local Secret Service. Set
+`NIMBO_E2E_FOLDER_ID` to a dedicated, disposable Drive folder outside the
+configured backup target. Each test creates a uniquely named child folder
+and moves that folder to the trash during teardown.
 
 ```sh
+NIMBO_E2E_FOLDER_ID="SANDBOX_FOLDER_ID" PYTHONPATH=src .venv/bin/python -m pytest tests/e2e -m e2e
 NIMBO_E2E_FOLDER_ID="SANDBOX_FOLDER_ID" scripts/e2e_soak.sh 10
 ```
 
-The runner reports an error if pytest collects no `e2e` tests.
+The [soak runner](../scripts/e2e_soak.sh) repeats the suite and prints a summary.
+It reports an error if pytest collects no `e2e` tests.
+
+- Set `NIMBO_E2E_LARGE=1` to include the interrupted 2 GiB upload. Allow 2 GiB
+  of Drive quota for each run because files in the trash still count against it.
+- Set `NIMBO_E2E_COMPUTERS_FOLDER_ID` to a disposable folder created under
+  **Computers** by Google Drive for desktop. This folder must be inside
+  `NIMBO_E2E_FOLDER_ID` or be the same folder. To test a separate Computers
+  sandbox, set both variables to its ID and add `-k computers` to the pytest
+  command.
