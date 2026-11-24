@@ -1,0 +1,149 @@
+[tui]
+service = "Google Drive"
+loading = "Loading…"
+tomorrow = "tomorrow, {time}"
+percent = "{value}%"
+separator = " · "
+
+[tui.action]
+backup = "Back up"
+stop = "Stop"
+pending = "Pending"
+history = "History"
+settings = "Settings"
+diagnostics = "Diagnostics"
+quit = "Quit"
+back = "Back"
+review = "Review deletions"
+review_short = "Review"
+confirm = "Confirm and back up"
+undo = "Undo deletions"
+save = "Save"
+
+[tui.dashboard]
+coverage = "{percent} backed up"
+no_coverage = "Coverage will appear after the first scan"
+starting = "Starting backup…"
+working = "Backing up"
+backing_up = "Backing up {folder}"
+with_figure = "{label} — {percent}"
+speed = "{size}/s"
+remaining = "{duration} left"
+last = "Last backup"
+next = "Next backup"
+space = "Space"
+recent = "Recent backups"
+quota = "{used} of {total}"
+quota_used = "{size} used"
+file_size = "{sent} of {total}"
+speed_history = "Speed · last 60 s"
+start_requested = "Backup requested"
+stop_requested = "Stop requested"
+
+[tui.folder]
+up_to_date = "up to date"
+running = "backing up"
+waiting = "waiting"
+no_disk = "disk not mounted"
+error = "needs attention"
+paused = "paused"
+unknown = "awaiting scan"
+
+[tui.folder.changes]
+one = "{count} change"
+other = "{count} changes"
+
+[tui.pending]
+filter = "Filter by path"
+locked = "A backup is running or the index is in use. Open Pending again in a moment."
+command = "Run `backup pendientes` to preview changes."
+root = "Drive root"
+empty = "No pending changes"
+no_match = "No changes match this filter"
+move_path = "{source} → {target}"
+issue = "A path needs attention"
+issue_at = "{path} · {message}"
+more_issues = "{count} more notices"
+
+[tui.pending.count]
+one = "{count} change"
+other = "{count} changes"
+
+[tui.pending.kind]
+mkdir = "Create folders"
+upload = "Upload"
+update = "Update"
+move = "Move"
+touch = "Update dates"
+adopt = "Adopt"
+trash = "Move to trash"
+
+[tui.history]
+date = "Started"
+result = "Result"
+uploaded = "Uploaded"
+updated = "Updated"
+trashed = "Trashed"
+empty = "No backups in history"
+detail = "Backup details"
+totals = "{uploaded} uploaded · {updated} updated · {moved} moved · {trashed} trashed\n{size} transferred"
+failed_at = "{path} · {message}"
+undo_description = "Restore the {count} items moved to the trash by this backup. Existing local files will be kept."
+undo_working = "Restoring items…"
+undo_summary = "{untrashed} removed from trash · {restored} files restored · {skipped} existing · {failed} failed"
+
+[tui.settings]
+folders = "Folders to back up"
+time = "Daily time"
+max_deletes = "Deletion limit"
+max_ratio = "Folder limit (%)"
+min_files = "Minimum files"
+exclusions = "Exclusions"
+patterns_hint = "Enter one pattern per line."
+invalid_time = "Enter a 24-hour time in HH:MM format."
+invalid_deletes = "Enter a whole number of deletions, zero or greater."
+invalid_ratio = "Enter a folder limit greater than 0% and at most 100%."
+invalid_min_files = "Enter a whole number of minimum files, zero or greater."
+invalid_exclusions = "Check the exclusion patterns and try again."
+saved = "Settings saved and schedule updated."
+saving = "Saving settings…"
+conflict = "Settings changed outside this window. Reopen Settings to load the latest values."
+save_failed = "Settings could not be saved. Check the configuration file and try again."
+units_failed = "Settings saved. The timer could not be updated. Check systemd and retry Save."
+
+[tui.confirm]
+notice = "The last backup paused to review deletions."
+title = "Review deletions"
+description = "Confirm that these items can be moved to the Google Drive trash."
+preview_limit = "The preview shows the first 500 items. Approval applies to the entire deletion plan."
+path = "{path} · {files}"
+stale = "This approval is no longer current. Return to the dashboard and review the latest backup."
+working = "Requesting backup…"
+
+[tui.confirm.files]
+one = "{count} file"
+other = "{count} files"
+
+[tui.diagnostics]
+command = "Run `backup diagnostico` to check the backup setup."
+empty = "No diagnostic checks available."
+
+[tui.welcome]
+title = "Set up your first backup"
+description = "Choose the folders on this computer and their destination in Google Drive."
+command = "Run `backup instalar` to begin."
+
+[tui.error]
+config = "The configuration could not be read. Check it with `backup diagnostico`."
+index = "The backup index could not be read. Check it with `backup diagnostico`."
+progress = "Live progress is unavailable. It will be checked again shortly."
+service = "The backup service could not be checked. Run `backup diagnostico`."
+source = "The backup folders could not be checked. Check the source disk."
+start = "The backup could not be started. Check the service with `backup diagnostico`."
+stop = "The backup could not be stopped. Check the service with `backup diagnostico`."
+preview = "The preview could not be loaded. Try again or run `backup diagnostico`."
+diagnostics = "The checks could not be completed. Run `backup diagnostico`."
+approval = "The confirmed backup could not be started. Check the service and try again."
+undo = "Restoration could not be completed. Check the backup with `backup diagnostico`."
+operation = "The operation could not be completed."
+launcher = "The backup command could not be found. Run `backup instalar` and try again."

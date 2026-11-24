@@ -1,0 +1,149 @@
+[tui]
+service = "Google Drive"
+loading = "Cargando…"
+tomorrow = "mañana, {time}"
+percent = "{value} %"
+separator = " · "
+
+[tui.action]
+backup = "Respaldar"
+stop = "Detener"
+pending = "Pendientes"
+history = "Historial"
+settings = "Ajustes"
+diagnostics = "Diagnóstico"
+quit = "Salir"
+back = "Volver"
+review = "Revisar borrados"
+review_short = "Revisar"
+confirm = "Confirmar y respaldar"
+undo = "Deshacer borrados"
+save = "Guardar"
+
+[tui.dashboard]
+coverage = "{percent} respaldado"
+no_coverage = "La cobertura aparecerá tras el primer escaneo"
+starting = "Iniciando respaldo…"
+working = "Respaldando"
+backing_up = "Respaldando {folder}"
+with_figure = "{label} — {percent}"
+speed = "{size}/s"
+remaining = "quedan {duration}"
+last = "Último respaldo"
+next = "Próximo"
+space = "Espacio"
+recent = "Respaldos recientes"
+quota = "{used} de {total}"
+quota_used = "{size} usados"
+file_size = "{sent} de {total}"
+speed_history = "Velocidad · últimos 60 s"
+start_requested = "Respaldo solicitado"
+stop_requested = "Detención solicitada"
+
+[tui.folder]
+up_to_date = "al día"
+running = "respaldando"
+waiting = "en espera"
+no_disk = "disco no montado"
+error = "requiere atención"
+paused = "en pausa"
+unknown = "por escanear"
+
+[tui.folder.changes]
+one = "{count} cambio"
+other = "{count} cambios"
+
+[tui.pending]
+filter = "Filtrar por ruta"
+locked = "Hay un respaldo en curso o el índice está en uso. Vuelve a abrir Pendientes en un momento."
+command = "Ejecuta `backup pendientes` para ver los cambios."
+root = "Raíz de Drive"
+empty = "No hay cambios pendientes"
+no_match = "Ningún cambio coincide con el filtro"
+move_path = "{source} → {target}"
+issue = "Una ruta requiere atención"
+issue_at = "{path} · {message}"
+more_issues = "{count} avisos más"
+
+[tui.pending.count]
+one = "{count} cambio"
+other = "{count} cambios"
+
+[tui.pending.kind]
+mkdir = "Crear carpetas"
+upload = "Subir"
+update = "Actualizar"
+move = "Mover"
+touch = "Actualizar fechas"
+adopt = "Adoptar"
+trash = "Enviar a la papelera"
+
+[tui.history]
+date = "Inicio"
+result = "Resultado"
+uploaded = "Subidos"
+updated = "Actualizados"
+trashed = "En papelera"
+empty = "No hay respaldos en el historial"
+detail = "Detalle del respaldo"
+totals = "{uploaded} subidos · {updated} actualizados · {moved} movidos · {trashed} en papelera\n{size} transferidos"
+failed_at = "{path} · {message}"
+undo_description = "Restaura los {count} elementos que este respaldo envió a la papelera. Los archivos locales existentes se conservan."
+undo_working = "Restaurando elementos…"
+undo_summary = "{untrashed} fuera de la papelera · {restored} archivos restaurados · {skipped} existentes · {failed} con error"
+
+[tui.settings]
+folders = "Carpetas que se respaldan"
+time = "Hora diaria"
+max_deletes = "Límite de borrados"
+max_ratio = "Límite por carpeta (%)"
+min_files = "Mínimo de archivos"
+exclusions = "Exclusiones"
+patterns_hint = "Escribe un patrón por línea."
+invalid_time = "Introduce una hora en formato HH:MM de 24 horas."
+invalid_deletes = "Introduce un número entero de borrados mayor o igual a cero."
+invalid_ratio = "Introduce un límite por carpeta mayor que 0 % y de hasta 100 %."
+invalid_min_files = "Introduce un mínimo de archivos entero mayor o igual a cero."
+invalid_exclusions = "Revisa los patrones de exclusión y vuelve a intentarlo."
+saved = "Ajustes guardados y horario actualizado."
+saving = "Guardando ajustes…"
+conflict = "Los ajustes cambiaron fuera de esta ventana. Vuelve a abrir Ajustes para cargar los valores actuales."
+save_failed = "No se guardaron los ajustes. Revisa el archivo de configuración y vuelve a intentarlo."
+units_failed = "Se guardaron los ajustes. Revisa systemd y vuelve a pulsar Guardar para actualizar el temporizador."
+
+[tui.confirm]
+notice = "El último respaldo se pausó para revisar borrados."
+title = "Revisar borrados"
+description = "Confirma que estos elementos pueden enviarse a la papelera de Google Drive."
+preview_limit = "La lista muestra los primeros 500 elementos. La aprobación abarca todo el plan de borrado."
+path = "{path} · {files}"
+stale = "Esta aprobación ya no corresponde al último respaldo. Vuelve al panel para revisar el respaldo más reciente."
+working = "Solicitando respaldo…"
+
+[tui.confirm.files]
+one = "{count} archivo"
+other = "{count} archivos"
+
+[tui.diagnostics]
+command = "Ejecuta `backup diagnostico` para revisar la configuración del respaldo."
+empty = "No hay comprobaciones de diagnóstico disponibles."
+
+[tui.welcome]
+title = "Configura tu primer respaldo"
+description = "Elige las carpetas de este equipo y su destino en Google Drive."
+command = "Ejecuta `backup instalar` para empezar."
+
+[tui.error]
+config = "No se pudo leer la configuración. Revísala con `backup diagnostico`."
+index = "No se pudo leer el índice. Revísalo con `backup diagnostico`."
+progress = "No hay datos de avance disponibles. Se volverán a consultar en breve."
+service = "No se pudo consultar el servicio de respaldo. Ejecuta `backup diagnostico`."
+source = "No se pudieron comprobar las carpetas. Revisa el disco de origen."
+start = "No se pudo iniciar el respaldo. Revisa el servicio con `backup diagnostico`."
+stop = "No se pudo detener el respaldo. Revisa el servicio con `backup diagnostico`."
+preview = "No se pudo cargar la vista previa. Intenta de nuevo o ejecuta `backup diagnostico`."
+diagnostics = "No se completaron las comprobaciones. Ejecuta `backup diagnostico`."
+approval = "No se pudo iniciar el respaldo confirmado. Revisa el servicio e inténtalo de nuevo."
+undo = "No se completó la restauración. Revisa el respaldo con `backup diagnostico`."
+operation = "No se pudo completar la operación."
+launcher = "No se encontró el comando de respaldo. Ejecuta `backup instalar` y vuelve a intentarlo."

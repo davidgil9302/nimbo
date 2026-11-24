@@ -54,6 +54,11 @@ class Paths:
         return cls(config_dir=Path(config), state_dir=Path(state))
 
     def ensure(self) -> None:
-        """Create both directories (private to the user)."""
+        """Create the config, state and log directories and keep them private (0700).
+
+        A directory that already exists with broader permissions is tightened.
+        """
         for directory in (self.config_dir, self.state_dir, self.log_dir):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if directory.stat().st_mode & 0o077:
+                directory.chmod(0o700)

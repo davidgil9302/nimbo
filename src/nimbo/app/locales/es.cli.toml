@@ -1,0 +1,260 @@
+[cli]
+description = "Mantén una copia espejo de las carpetas de tu equipo en Google Drive."
+commands = "Comandos"
+command = "comando"
+answer_yes = "s"
+answer_no = "n"
+confirm_choice = "{message} [s/N]"
+not_installed = "Configura tu respaldo con backup instalar."
+no_runs = "Aún no hay respaldos registrados."
+no_changes = "Tu copia espejo está al día."
+inhibit = "Nimbo está respaldando archivos en Google Drive"
+queued = "El respaldo quedó en cola."
+fallback = "El servicio no está disponible. Nimbo ejecutará el respaldo en esta terminal."
+stopping = "Deteniendo de forma segura"
+stop_requested = "El servicio se detuvo."
+no_service_to_stop = "El servicio de respaldo no está disponible."
+confirm_next = "Ejecuta backup ahora --confirmar para revisar los borrados."
+no_confirmation = "El último respaldo no tiene borrados pendientes de confirmación."
+confirmation_changed = "La lista de borrados cambió. Ejecuta backup ahora para preparar una lista actualizada."
+confirm_trash = "¿Mover los elementos de la lista a la papelera de Drive?"
+tui_unavailable = "El panel no está disponible. Ejecuta backup estado para consultar tu respaldo."
+systemd_error = "Falló la operación del servicio. Ejecuta backup diagnostico para revisar tu sesión de systemd."
+local_error = "Nimbo no pudo leer o guardar datos locales. Revisa las rutas, los permisos y el espacio disponible."
+live_metrics = "{phase} · {rate}/s · restante {eta}"
+run_line = "{result} · subidos {uploaded} · actualizados {updated} · movidos {moved} · en la papelera {trashed} · fallidos {failed}"
+undo_line = "Recuperados de la papelera {untrashed} · archivos restaurados {restored} · existentes conservados {existing} · fallidos {failed}"
+hooks_ignored = "Se ignoraron los ajustes de prueba porque la dirección de Drive debe comenzar con http://127.0.0.1 o http://localhost e incluir un puerto."
+oauth_hook_ignored = "Se ignoró el ajuste OAuth de prueba porque su dirección debe ser local e incluir un puerto."
+unsafe_path = "Un archivo de estado de Nimbo apunta fuera del directorio configurado. Revisa el enlace simbólico antes de continuar."
+undo_other_mirror = "Esa ejecución pertenece a una configuración anterior. Revisa el destino anterior en Drive."
+version_line = "nimbo {version}"
+
+[cli.parser]
+usage = "Uso:"
+options = "Opciones:"
+positionals = "Argumentos:"
+invalid = "Los argumentos no son válidos. Ejecuta {prog} --help para ver las opciones."
+
+[cli.command_help]
+now = "Inicia un respaldo."
+pending = "Consulta los cambios pendientes."
+status = "Muestra el estado del respaldo y del servicio."
+history = "Muestra los respaldos recientes."
+undo = "Recupera elementos de la papelera de Drive."
+verify = "Comprueba la copia en Drive frente a los archivos locales."
+stop = "Detiene el servicio de respaldo de forma segura."
+install = "Configura Nimbo y el horario diario."
+connect = "Vuelve a conectar tu cuenta de Google."
+uninstall = "Elimina el respaldo programado."
+doctor = "Revisa la configuración del respaldo."
+log = "Muestra los últimos registros."
+run = "Ejecuta el respaldo y muestra el resultado."
+
+[cli.metavar]
+path = "ruta"
+id = "id"
+secret = "secreto"
+number = "n"
+run = "ejecución"
+folders = "a,b,c"
+target = "url/id"
+time = "hh:mm"
+
+[cli.option]
+help = "Muestra esta ayuda."
+version = "Muestra la versión de Nimbo."
+no_motion = "Reduce el movimiento de las vistas de terminal."
+language = "Elige español (es) o inglés (en)."
+verbose = "Registra más detalles durante el respaldo."
+here = "Ejecuta el respaldo en esta terminal."
+confirm = "Revisa y aprueba los últimos borrados pendientes."
+yes = "Aprueba la acción que pide este comando."
+json = "Imprime datos con versión para scripts."
+count = "Limita el número de entradas."
+run_id = "Número de ejecución. Por defecto, usa la última con borrados registrados."
+repair = "Aplica el plan habitual de respaldo para reparar las diferencias."
+auto = "Usa una solicitud manual reciente o marca la ejecución como programada."
+client_json = "Lee el archivo .json de un cliente de escritorio de Google."
+client_id = "Indica el ID del cliente de escritorio de Google."
+client_secret = "Indica el secreto del cliente de escritorio de Google."
+source = "Indica el directorio de origen."
+folders = "Selecciona subcarpetas separadas por comas."
+target = "Indica el enlace o ID de la carpeta destino."
+at = "Indica la hora diaria en formato de 24 horas."
+unattended = "Usa los argumentos sin pedir datos en la terminal."
+no_service = "Guarda la configuración sin instalar las unidades de systemd."
+purge = "Elimina también la configuración, el índice, los registros y el token guardado."
+revoke = "Revoca también la credencial guardada en Google."
+
+[cli.json_help]
+status = "Con --json, el esquema 1 incluye config, last_run, service y folders. La configuración y el último respaldo valen null si faltan. La configuración resume origen, destino, horario, servicio e idioma."
+pending = "Con --json, el esquema 1 incluye folders, totals, warnings, errors, scan_problems y brake. Cada carpeta lista upload y update (rel, size en bytes), move (from, to) y trash (rel, affected_files)."
+history = "Con --json, el esquema 1 incluye runs, una lista de resúmenes de respaldo del más reciente al más antiguo."
+
+[cli.status]
+source = "Origen · {path}"
+last_run = "Último respaldo · {result}"
+service = "Servicio · {state}"
+next_run = "Próximo respaldo · {time}"
+running = "En curso"
+enabled = "Programado"
+inactive = "Inactivo"
+
+[cli.label]
+folder = "Carpeta"
+local_files = "Archivos locales"
+pending_files = "Archivos pendientes"
+operation = "Operación"
+path = "Ruta"
+size = "Tamaño"
+run = "Ejecución"
+time = "Finalizó"
+result = "Resultado"
+uploaded = "Subidos"
+updated = "Actualizados"
+moved = "Movidos"
+trashed = "En la papelera"
+failed = "Fallidos"
+count = "Cantidad"
+affected_files = "Archivos afectados"
+
+[cli.op]
+mkdir = "Crear carpeta"
+upload = "Subir"
+update = "Actualizar"
+touch = "Sincronizar fecha"
+move = "Mover"
+adopt = "Adoptar"
+trash = "Mover a la papelera"
+
+[cli.audit]
+missing = "Falta en Drive"
+extra = "Solo en Drive"
+mismatched = "Es distinto en Drive"
+duplicates = "Duplicado en Drive"
+clean = "La auditoría no encontró diferencias."
+remaining = "La auditoría aún encontró diferencias después de la reparación."
+repair_hint = "Ejecuta backup verificar --reparar para aplicar el plan de respaldo."
+
+[wizard]
+requirements = "Python {version} y el almacén de credenciales están disponibles."
+no_notifications = "Las notificaciones de escritorio no están disponibles. Instala notify-send para recibirlas."
+interactive_required = "Usa una terminal para el asistente o indica --no-interactivo con las opciones de configuración."
+input_closed = "La entrada se cerró antes de terminar la configuración."
+guide = "Crea un cliente OAuth de escritorio de Google y descarga sus credenciales. Consulta {path}."
+open_guide = "¿Abrir la guía de OAuth en el navegador?"
+client_id = "ID del cliente de escritorio de Google"
+client_secret = "Secreto del cliente de escritorio de Google"
+client_id_invalid = "Introduce un ID del cliente de escritorio de Google que termine en .apps.googleusercontent.com."
+client_secret_invalid = "Introduce un secreto válido del cliente de escritorio de Google."
+client_json_invalid = "El archivo debe contener las credenciales de un cliente de escritorio de Google."
+client_options_conflict = "Elige --client-json o las opciones de ID y secreto del cliente."
+source = "Directorio de origen"
+folders = "Selecciona los números de las subcarpetas, separados por comas"
+target = "Enlace o ID de la carpeta destino"
+time = "Hora diaria de inicio"
+source_required = "Indica el directorio de origen con --source."
+folders_required = "Indica las subcarpetas que quieres respaldar con --folders."
+target_required = "Indica la carpeta de Drive con --target."
+folders_invalid = "Selecciona subcarpetas distintas del directorio de origen."
+source_contains_state = "La selección incluye la configuración o el estado de Nimbo. Elige subcarpetas fuera de esos directorios."
+time_invalid = "Indica una hora diaria en formato hh:mm de 24 horas."
+replace_client = "¿Cambiar el cliente de escritorio de Google?"
+replace_source = "¿Cambiar el origen o las subcarpetas seleccionadas en {root}?"
+replace_target = "¿Cambiar el destino {target} de Drive?"
+replace_time = "¿Cambiar la hora diaria de inicio de las {time}?"
+replace_units = "¿Actualizar las unidades de systemd instaladas?"
+continue_without_units = "¿Continuar la configuración sin programar el servicio?"
+service_unavailable = "El gestor de usuario de systemd no está disponible. Inicia sesión o usa --sin-servicio."
+command_missing = "Instala el comando backup o nimbo antes de activar el servicio diario."
+apply = "¿Aplicar los cambios a la configuración existente? Usa --si para cambios sin confirmación interactiva."
+kept = "Se conservó la configuración existente."
+already_configured = "Nimbo ya está configurado con estas opciones."
+browser = "Autoriza el acceso a Google Drive en tu navegador para continuar."
+account = "Cuenta conectada · {name}"
+target_ok = "Destino en Drive · {name}"
+setup_changed = "La configuración cambió mientras trabajabas. Revísala y vuelve a ejecutar el comando."
+unfinished_run = "Quedaron operaciones pendientes de un respaldo anterior. Ejecuta el respaldo con la configuración existente antes de cambiar de espejo."
+done = "La configuración está lista. Ejecuta backup pendientes para revisar los cambios."
+preview = "¿Revisar los cambios pendientes ahora?"
+connected = "Cuenta reconectada a Google Drive · {name}"
+purge = "¿Eliminar la configuración, el índice, los registros y la credencial guardada de Google?"
+revoke = "¿Revocar también esta autorización en Google?"
+purged = "Se eliminaron la configuración local y la credencial guardada."
+uninstalled = "Se eliminó el respaldo programado."
+
+[doctor.config]
+ok = "La configuración es válida."
+bad = "La configuración no existe o no es válida."
+hint = "Ejecuta backup instalar o corrige la configuración."
+
+[doctor.keyring]
+ok = "El almacén de credenciales está disponible."
+bad = "El almacén de credenciales no está disponible."
+hint = "Inicia sesión en tu escritorio y desbloquea el llavero."
+
+[doctor.token]
+ok = "La autorización de Google está activa."
+bad = "No se pudo renovar la autorización de Google."
+hint = "Ejecuta backup conectar y autoriza el acceso en el navegador."
+
+[doctor.api]
+ok = "Google Drive respondió."
+bad = "Google Drive no respondió correctamente."
+hint = "Revisa tu conexión a internet y el acceso a tu cuenta de Google."
+
+[doctor.target]
+ok = "Destino en Drive · {name}"
+bad = "La carpeta destino no existe, está en la papelera o no tienes acceso."
+hint = "Revisa el enlace y los permisos del destino en Drive."
+
+[doctor.source]
+ok = "El directorio de origen está disponible."
+bad = "El directorio de origen no existe o el disco no está montado."
+hint = "Conecta el disco seleccionado y abre el directorio de origen."
+
+[doctor.sentinel]
+ok = "El testigo del origen es válido."
+bad = "El testigo del origen falta o no coincide."
+hint = "Comprueba que conectaste el origen elegido durante la instalación."
+
+[doctor.folders]
+ok = "Las subcarpetas seleccionadas están disponibles."
+bad = "Una subcarpeta no existe, está vacía o no se puede leer."
+hint = "Revisa las subcarpetas seleccionadas y sus permisos."
+
+[doctor.units]
+ok = "Las unidades de systemd están instaladas y el temporizador está habilitado."
+bad = "El servicio diario no está disponible o está deshabilitado."
+hint = "Ejecuta backup instalar para programarlo o usa backup ahora para un respaldo manual."
+
+[doctor.next]
+ok = "Próximo respaldo programado · {time}"
+bad = "No hay un próximo respaldo programado."
+hint = "Comprueba que el temporizador de Nimbo esté habilitado en tu sesión de systemd."
+
+[doctor.db]
+ok = "El índice local pasó la comprobación de integridad."
+bad = "El índice local no existe, no se puede leer o está dañado."
+hint = "Revisa el directorio de estado de Nimbo y sus permisos."
+
+[doctor.no_run]
+ok = "Aún no hay respaldos registrados."
+bad = "No se pudo leer la última ejecución."
+hint = "Ejecuta backup historial para revisar las ejecuciones anteriores."
+
+[doctor.last]
+ok = "Último respaldo · {result}"
+bad = "Último respaldo · {result}"
+hint = "Ejecuta backup historial para revisar el último resultado."
+
+[doctor.space]
+ok = "Espacio libre para el estado local · {space}"
+bad = "El almacenamiento del estado local está lleno o no está disponible."
+hint = "Revisa el almacenamiento y libera espacio en el directorio de estado."
+
+[doctor.version]
+ok = "Versión de Nimbo · {version}"
+bad = "No se pudo determinar la versión de Nimbo."
+hint = "Revisa la instalación de Nimbo."
