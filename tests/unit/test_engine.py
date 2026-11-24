@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import md5
 from pathlib import Path
 from threading import Event
+from typing import Literal
 
 import httpx
 import pytest
@@ -285,6 +286,103 @@ def test_allow_brakes_flag(mirror: _Harness) -> None:
     path.unlink()
 
     assert mirror.run(allow_brakes=True).trashed == 1
+
+
+@pytest.mark.parametrize("fault", [None, "drop_response", "crash_after", "audit_unavailable"])
+def test_approved_folder_trash_reports_items_added_during_walk(
+    mirror: _Harness, fault: Literal["drop_response", "crash_after", "audit_unavailable"] | None
+) -> None:
+    mirror.deps.cfg = replace(mirror.deps.cfg, safety=SafetyConfig(max_deletes=0))
+    planned = mirror.put("Docs/Old/Deep/report", b"planned")
+    mirror.run()
+    tree = mirror.index.load_tree(mirror.target).by_rel()
+    [old] = tree["Docs/Old"]
+    [deep] = tree["Docs/Old/Deep"]
+    planned.unlink()
+    planned.parent.rmdir()
+    planned.parent.parent.rmdir()
+    blocked = mirror.run(result=RunResult.NEEDS_CONFIRMATION)
+    assert blocked.fingerprint and blocked.trash_preview == ["Docs/Old\t1"]
+    write_approval(mirror.paths.approval_file, blocked.fingerprint, now=mirror.clock())
+
+    added: dict[str, str] = {}
+
+    def add_after_old_was_listed(request: httpx.Request) -> bool:
+        if (
+            request.method != "GET"
+            or request.url.params.get("q") != f"('{deep.id}' in parents) and trashed = false"
+        ):
+            return False
+        added["Docs/Old/Document"] = mirror.fake.add_native("Document", old.id)
+        folder = added["Docs/Old/Late"] = mirror.fake.add_folder("Late", old.id)
+        added["Docs/Old/Late/binary"] = mirror.fake.add_file("binary", folder, b"only on Drive")
+        return True
+
+    mirror.fake.faults.add(Fault(add_after_old_was_listed, "delay"))
+    if fault in ("drop_response", "crash_after"):
+        mirror.fake.faults.add(Fault(_patch, fault))
+    if fault == "audit_unavailable":
+        mirror.fake.faults.add(
+            Fault(
+                lambda request: (
+                    request.url.params.get("q") == f"('{old.id}' in parents) and trashed = true"
+                ),
+                "status",
+                status=403,
+                reason="forbidden",
+            )
+        )
+        incomplete = mirror.run(result=RunResult.PARTIAL)
+        assert incomplete.failed == [("Docs/Old", "forbidden")]
+        assert [op.file_id for op in mirror.index.inflight_ops()] == [old.id]
+    if fault == "crash_after":
+        with pytest.raises(SimulatedCrash):
+            mirror.run()
+        mirror.reopen()
+        mirror.engine.preview()
+
+    summary = mirror.run(result=RunResult.PARTIAL)
+
+    assert summary.failed == []
+    assert summary.trashed == (0 if fault in ("crash_after", "audit_unavailable") else 1)
+    assert summary.warnings == [PlanIssue("trash-took-new-items", rel) for rel in sorted(added)]
+    assert len(added) == 3 and all(mirror.fake.file(file_id).trashed for file_id in added.values())
+    snapshots = mirror.index.trash_files(summary.run_id)
+    for rel, file_id in added.items():
+        item = mirror.fake.file(file_id)
+        snapshot = snapshots[file_id]
+        assert (snapshot.rel, snapshot.size, snapshot.md5) == (rel, item.size, item.md5)
+
+    mirror.deps.drive.update_metadata(old.id, trashed=False)
+    mirror.fake.set_content(added["Docs/Old/Late/binary"], b"edited on Drive")
+    restored = mirror.engine.undo(summary.run_id)
+
+    assert restored.untrashed == 1 and restored.restored_files == 2
+    assert ("Docs/Old/Late/binary", "changed_since_trash") in restored.failed
+    assert (mirror.root / "Docs/Old/Late/binary").read_bytes() == b"edited on Drive"
+    assert not mirror.fake.file(added["Docs/Old/Document"]).trashed
+    assert planned.read_bytes() == b"planned"
+
+
+def test_folder_trash_without_unexpected_items_stays_ok(mirror: _Harness) -> None:
+    report = mirror.put("Docs/Old/report", b"planned")
+    mirror.run()
+    tree = mirror.index.load_tree(mirror.target).by_rel()
+    [old] = tree["Docs/Old"]
+    [item] = tree["Docs/Old/report"]
+    already_trashed = mirror.fake.add_folder("Already trashed", old.id)
+    descendant = mirror.fake.add_file("previous", already_trashed, b"previous")
+    mirror.deps.drive.update_metadata(already_trashed, trashed=True)
+    report.unlink()
+    report.parent.rmdir()
+
+    summary = mirror.run()
+
+    assert summary.trashed == 1 and summary.warnings == [] and summary.failed == []
+    assert set(mirror.index.trash_files(summary.run_id)) == {item.id}
+    restored = mirror.engine.undo(summary.run_id)
+    assert restored.restored_files == 1 and restored.failed == []
+    assert mirror.fake.file(descendant).trashed
 
 
 def test_sentinel_missing_skips(mirror: _Harness) -> None:

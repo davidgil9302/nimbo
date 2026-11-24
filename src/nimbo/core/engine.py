@@ -17,7 +17,7 @@ from .allocate import allocate
 from .config import Config
 from .drive import DriveClient
 from .errors import AuthError, LockedError, NimboError, Stopped
-from .executor import ExecReport, Executor
+from .executor import TRASH_TOOK_NEW_ITEMS, ExecReport, Executor, _audit_folder_trash
 from .hasher import LocalHasher
 from .index import (
     META_ACCOUNT,
@@ -318,7 +318,7 @@ class Engine:
             },
         )
 
-    def _reconcile(self, run_id: int | None, stop: Event) -> None:
+    def _reconcile(self, summary: RunSummary | None, stop: Event) -> None:
         deps = self._deps
         inflight = deps.index.inflight_ops()
         if inflight:
@@ -333,15 +333,23 @@ class Engine:
                 if op.kind is OpKind.TRASH:
                     # Preview has no run ID for the undo log. Keep its trash
                     # intents until a backup can journal their reconciled outcome.
-                    if run_id is None:
+                    if summary is None:
                         continue
                     if item is not None and item.trashed:
-                        before = deps.index.get_remote(op_id)
+                        additions = (
+                            _audit_folder_trash(deps.drive, deps.index, op, stop.is_set)
+                            if item.is_folder
+                            else []
+                        )
                         deps.index.complete_op(
                             op,
                             remove_subtrees=[op_id],
-                            trash_log_run=run_id,
-                            trashed_is_folder=before is not None and before.is_folder,
+                            trash_log_run=summary.run_id,
+                            trashed_is_folder=item.is_folder,
+                            trash_additions=additions,
+                        )
+                        summary.warnings.extend(
+                            PlanIssue(TRASH_TOOK_NEW_ITEMS, entry.rel) for entry in additions
                         )
                         continue
                     if item is None:
@@ -392,7 +400,7 @@ class Engine:
         index.set_meta(META_QUOTA_USED, str(about.usage))
         self._reset_target()
         _phase(progress, "listing")
-        self._reconcile(summary.run_id if summary is not None else None, stop)
+        self._reconcile(summary, stop)
         indexer = self._indexer(stop)
         try:
             indexer.refresh()
@@ -551,8 +559,10 @@ class Engine:
                 "cancelled": RunResult.CANCELLED,
                 "upload_limit_exceeded": RunResult.PAUSED,
             }.get(report.stop_reason, RunResult.FAILED)
+        elif report.failed or any(issue.code == TRASH_TOOK_NEW_ITEMS for issue in summary.warnings):
+            summary.result = RunResult.PARTIAL
         else:
-            summary.result = RunResult.PARTIAL if report.failed else RunResult.OK
+            summary.result = RunResult.OK
 
     def _folder_stats(
         self, prepared: _Prepared, now: str, summary: RunSummary | None = None

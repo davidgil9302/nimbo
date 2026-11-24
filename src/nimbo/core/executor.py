@@ -5,14 +5,14 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from threading import Event, Lock
 
-from .drive import DriveClient
+from .drive import _FILES, LIST_GROUP_MAX, DriveClient, _literal, _read_json
 from .errors import (
     AuthError,
     BadRequest,
@@ -32,7 +32,17 @@ from .errors import (
     UploadLimitExceeded,
 )
 from .index import META_CHANGES_RELIABLE, META_CHANGES_TOKEN, META_FORCE_FULL, Index, TrashFile
-from .model import OWNER_PROPERTY, Op, OpKind, Phase, PlanIssue, RemoteFile, drive_ms, rel_join
+from .model import (
+    FILE_FIELDS,
+    OWNER_PROPERTY,
+    Op,
+    OpKind,
+    Phase,
+    PlanIssue,
+    RemoteFile,
+    drive_ms,
+    rel_join,
+)
 from .progress import ProgressTracker
 from .transfer import Uploader, UploadRequest
 from .tree import RemoteTree, _rel_component
@@ -40,6 +50,7 @@ from .tree import RemoteTree, _rel_component
 _CREATE = {OpKind.MKDIR, OpKind.UPLOAD}
 _WITH_PARENT = _CREATE | {OpKind.MOVE}
 _UPLOAD = {OpKind.UPLOAD, OpKind.UPDATE}
+TRASH_TOOK_NEW_ITEMS = "trash-took-new-items"
 _CHANGE_POLL_INTERVAL = 1.0
 _PROGRESS_PHASE = {
     Phase.MKDIR: "mkdir",
@@ -308,6 +319,52 @@ def _same_item(planned: RemoteFile, current: RemoteFile | None) -> bool:
     return current == planned
 
 
+def _inherited_trash_children(
+    drive: DriveClient, parents: Sequence[str], should_stop: Callable[[], bool]
+) -> Iterator[RemoteFile]:
+    # An explicitly trashed child (and its subtree) was already in the trash.
+    # The ordinary child listing discards this field when parsing RemoteFile.
+    clauses = " or ".join(f"{_literal(parent)} in parents" for parent in parents)
+    params: dict[str, str | int] = {
+        "fields": f"nextPageToken,files({FILE_FIELDS},explicitlyTrashed)",
+        "q": f"({clauses}) and trashed = true",
+        "spaces": "drive",
+        "pageSize": 1000,
+    }
+    while True:
+        data = drive._request("GET", _FILES, _read_json, params=params, should_stop=should_stop)
+        for raw in data.get("files", ()):
+            if raw.get("trashed") and not raw.get("explicitlyTrashed"):
+                yield RemoteFile.from_api(raw)
+        if not (token := data.get("nextPageToken")):
+            return
+        params["pageToken"] = token
+
+
+def _audit_folder_trash(
+    drive: DriveClient, index: Index, op: Op, should_stop: Callable[[], bool]
+) -> list[TrashFile]:
+    guarded = index.guarded_trash_ids(op)
+    if guarded is None:
+        return []  # Older intents have no reliable baseline.
+    assert op.file_id is not None
+    pending = deque([(op.file_id, op.rel)])
+    seen = {op.file_id}
+    unexpected = []
+    while pending:
+        group = dict(pending.popleft() for _ in range(min(len(pending), LIST_GROUP_MAX)))
+        for child in _inherited_trash_children(drive, tuple(group), should_stop):
+            if len(child.parents) != 1 or child.parents[0] not in group or child.id in seen:
+                continue
+            seen.add(child.id)
+            rel = rel_join(group[child.parents[0]], _rel_component(child.name))
+            if child.id not in guarded:
+                unexpected.append(TrashFile(child.id, rel, child.size, child.md5))
+            if child.is_folder:
+                pending.append((child.id, rel))
+    return sorted(unexpected, key=lambda item: (item.rel, item.file_id))
+
+
 def _first_drift(before: RemoteTree, after: RemoteTree) -> str | None:
     for rel, item in before.walk():
         current = after.get(item.id)
@@ -555,6 +612,11 @@ class Executor:
             try:
                 self._check_index(run, op, file_id)
                 item, uploaded = self._apply(run, work, file_id)
+                additions = []
+                if op.kind is OpKind.TRASH and item.is_folder:
+                    # If the listing fails, keep the confirmed write open for reconciliation.
+                    work.trash_uncertain = True
+                    additions = _audit_folder_trash(self._drive, self._index, op, self._stop.is_set)
             except _FolderKept as exc:
                 self._failure(run, work, exc)
                 run.report.warnings.append(PlanIssue("folder-kept-protected", op.rel))
@@ -588,6 +650,10 @@ class Executor:
                         remove_subtrees=[file_id],
                         trash_log_run=run.id,
                         trashed_is_folder=item.is_folder,
+                        trash_additions=additions,
+                    )
+                    run.report.warnings.extend(
+                        PlanIssue(TRASH_TOOK_NEW_ITEMS, entry.rel) for entry in additions
                     )
                 else:
                     self._index.complete_op(
@@ -688,7 +754,7 @@ class Executor:
         ):
             raise RemoteChanged
 
-    def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> list[TrashFile]:
+    def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> None:
         expected: dict[str, tuple[RemoteFile, str]] = {}
         pending = [(folder.id, op.rel)]
         for parent, rel in pending:
@@ -717,11 +783,16 @@ class Executor:
                 if live.is_folder:
                     folders.append(live.id)
         if not blocked:
-            return [
-                TrashFile(item.id, expected[item.id][1], item.size, item.md5)
-                for item in covered.values()
-                if not item.is_folder
-            ]
+            self._index.record_trash_files(
+                op,
+                [
+                    TrashFile(item.id, expected[item.id][1], item.size, item.md5)
+                    for item in covered.values()
+                    if not item.is_folder
+                ],
+                guarded_ids=covered.keys(),
+            )
+            return
         for child_id in reversed(folders[1:]):
             if child_id in blocked:
                 blocked.add(covered[child_id].parents[0])
@@ -760,13 +831,13 @@ class Executor:
             if live is None or not _same_item(planned, live):
                 raise RemoteChanged
             self._check_live_parent(live, op.rel)
-            files = (
-                self._check_folder_trash(run, op, live)
-                if live.is_folder
-                else [TrashFile(file_id, op.rel, live.size, live.md5)]
-            )
             # Persist before sending so reconciliation can use the original metadata.
-            self._index.record_trash_files(op, files)
+            if live.is_folder:
+                self._check_folder_trash(run, op, live)
+            else:
+                self._index.record_trash_files(
+                    op, [TrashFile(file_id, op.rel, live.size, live.md5)]
+                )
             sent = True
 
         try:

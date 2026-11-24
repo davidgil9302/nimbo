@@ -17,7 +17,7 @@ from nimbo.core.errors import NimboError
 from nimbo.core.model import FolderStat, Op, OpKind, OpState, RemoteFile, RunSummary, utc_now_iso
 from nimbo.core.tree import RemoteTree
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 META_ROOT_UUID = "root_uuid"
 META_TARGET_ID = "target_root_id"
 # Metadata key for the Drive changes cursor.
@@ -82,6 +82,7 @@ _MIGRATIONS = {
           rel TEXT NOT NULL, size INTEGER, md5 TEXT, PRIMARY KEY (op_id, file_id))
         """,
     ),
+    3: ("ALTER TABLE op ADD COLUMN trash_guard TEXT",),
 }
 
 _UPSERT_REMOTE = """
@@ -162,7 +163,7 @@ def _op_row(row: sqlite3.Row) -> Op:
 
 @dataclass(frozen=True, slots=True)
 class TrashFile:
-    """Identify a covered file and its path, size and digest observed at trash time."""
+    """Identify a covered Drive item by its path and any size and digest at trash time."""
 
     file_id: str
     rel: str
@@ -516,8 +517,10 @@ class Index:
         with self._transaction(write=True):
             self._update_op(op, OpState.INFLIGHT, increment_attempts=True)
 
-    def record_trash_files(self, op: Op, files: Sequence[TrashFile]) -> None:
-        """Replace the observed file snapshots for a persisted trash intent.
+    def record_trash_files(
+        self, op: Op, files: Sequence[TrashFile], *, guarded_ids: Collection[str] | None = None
+    ) -> None:
+        """Replace the observed file snapshots and, if supplied, the guarded descendant IDs.
 
         Raise ValueError if the operation has no journal ID.
         """
@@ -525,10 +528,24 @@ class Index:
             raise ValueError("A persisted operation ID is required")
         with self._transaction(write=True):
             self._execute("DELETE FROM trash_file WHERE op_id = ?", (op.db_id,))
-            self._executemany(
-                "INSERT INTO trash_file (op_id, file_id, rel, size, md5) VALUES (?, ?, ?, ?, ?)",
-                ((op.db_id, file.file_id, file.rel, file.size, file.md5) for file in files),
-            )
+            self._insert_trash_files(op, files)
+            if guarded_ids is not None:
+                self._execute(
+                    "UPDATE op SET trash_guard = ? WHERE id = ?",
+                    (json.dumps(sorted(guarded_ids)), op.db_id),
+                )
+
+    def _insert_trash_files(self, op: Op, files: Sequence[TrashFile]) -> None:
+        self._executemany(
+            "INSERT INTO trash_file (op_id, file_id, rel, size, md5) VALUES (?, ?, ?, ?, ?)",
+            ((op.db_id, file.file_id, file.rel, file.size, file.md5) for file in files),
+        )
+
+    def guarded_trash_ids(self, op: Op) -> set[str] | None:
+        """Return the folder guard's observed descendant IDs, or None if it wasn't recorded."""
+        with self._transaction():
+            row = self._execute("SELECT trash_guard FROM op WHERE id = ?", (op.db_id,)).fetchone()
+            return None if row is None or row[0] is None else set(json.loads(row[0]))
 
     def complete_op(
         self,
@@ -538,10 +555,12 @@ class Index:
         remove_subtrees: Sequence[str] = (),
         trash_log_run: int | None = None,
         trashed_is_folder: bool = False,
+        trash_additions: Sequence[TrashFile] = (),
         local_md5: str | None = None,
     ) -> None:
         """Mark an operation done with its mirror, trash log and verified digest changes.
 
+        Append any audited descendants along with the corresponding trash log entry.
         A trash log entry requires ``op.file_id``, otherwise ``ValueError`` is raised.
         """
         with self._transaction(write=True):
@@ -553,6 +572,8 @@ class Index:
             if trash_log_run is not None:
                 if op.file_id is None:
                     raise ValueError("A Drive file ID is required for the trash log")
+                if trash_additions:
+                    self._insert_trash_files(op, trash_additions)
                 self._execute(
                     "INSERT INTO trash_log (run_id, file_id, rel, is_folder, op_id) "
                     "VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, file_id) DO UPDATE SET "

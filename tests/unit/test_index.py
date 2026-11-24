@@ -20,7 +20,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from nimbo.core.errors import NimboError
-from nimbo.core.index import _MIGRATIONS, META_CHANGES_TOKEN, SCHEMA_VERSION, Index
+from nimbo.core.index import _MIGRATIONS, META_CHANGES_TOKEN, SCHEMA_VERSION, Index, TrashFile
 from nimbo.core.model import (
     FOLDER_MIME,
     FolderStat,
@@ -129,13 +129,39 @@ def test_migrate_v1_preserves_trash_log_without_inventing_file_snapshots(db_path
         )
 
     with closing(Index(db_path)) as index:
-        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert index.last_run_with_trash() == 1
         assert index.trash_log(1) == [
             ("file", "Photos/report", False),
             ("folder", "Photos/old", True),
         ]
         assert index.trash_files(1) == {}
+
+
+def test_migrate_v2_preserves_trash_snapshots(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with monkeypatch.context() as previous:
+        previous.setattr("nimbo.core.index.SCHEMA_VERSION", 2)
+        with closing(Index(db_path)) as index:
+            assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            run_id = index.start_run("manual", STARTED)
+            op = Op(OpKind.TRASH, "Photos/old", "deleted-locally", file_id="folder")
+            index.save_ops(run_id, [op])
+            index.record_trash_files(
+                op, [TrashFile("file", "Photos/old/report", 10, "recorded-md5")]
+            )
+            index.complete_op(op, trash_log_run=run_id, trashed_is_folder=True)
+
+    with closing(Index(db_path)) as index:
+        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert index.guarded_trash_ids(op) is None
+        snapshot = index.trash_files(run_id)["file"]
+        assert (snapshot.rel, snapshot.size, snapshot.md5) == (
+            "Photos/old/report",
+            10,
+            "recorded-md5",
+        )
 
 
 def test_meta_set_get_delete(db: Index) -> None:

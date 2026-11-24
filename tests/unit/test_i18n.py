@@ -171,6 +171,7 @@ def test_every_reason_code_has_text():
             "remote_missing",
             "changed_since_trash",
             "folder-kept-protected",
+            "trash-took-new-items",
             "folder_ratio",
             "too_many_deletes",
         ]
