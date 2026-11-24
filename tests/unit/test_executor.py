@@ -39,7 +39,7 @@ from nimbo.core.remote_sync import RemoteIndexer
 from nimbo.core.transfer import Uploader, create_session_kind
 from nimbo.core.tree import RemoteTree
 from tests.fakedrive import FakeDrive, Fault, FaultPlan, SimulatedCrash
-from tests.system.helpers import make_mirror
+from tests.system.helpers import MULTIPART_MAX, make_mirror
 
 _CHUNK = 262144
 _OWNER = "mirror-owner"
@@ -1288,6 +1288,93 @@ def test_fresh_nested_tree_amortizes_drive_reads(tmp_path: Path) -> None:
     assert writes == 108
     assert reads <= summary.uploaded / 2, f"{reads} reads for {summary.uploaded} uploads"
     mirror.assert_state()
+
+
+@pytest.mark.parametrize(("kind", "budget"), [("sparse", 150), ("resumable", 200)])
+def test_fresh_tree_read_budget(tmp_path: Path, kind: str, budget: int) -> None:
+    """Count Drive reads for a sparse tree and a fresh batch of resumable files."""
+    if kind == "sparse":
+        spec = {f"Docs/a/b/c/x{i:03d}/file.txt": b"content" for i in range(100)}
+    else:
+        spec = {f"Docs/a/b/c/file{i:03d}.bin": MULTIPART_MAX + 1 for i in range(100)}
+    mirror = make_mirror(tmp_path, spec, parallel=4)
+    with mirror.open() as session:
+        summary = session.engine.run(trigger="manual")
+
+    assert summary.result is RunResult.OK and summary.uploaded == 100
+    reads = sum(call.method == "GET" for call in mirror.fake.calls)
+    assert reads <= budget, f"{reads} reads for {summary.uploaded} {kind} uploads"
+    mirror.assert_state()
+
+
+def test_create_polls_for_movement_of_ancestor_created_by_this_run(remote: _Harness) -> None:
+    """A new parent can be moved by another client after the first upload."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.mkdir("nested", parent=target)
+    ops = [
+        folder,
+        *(
+            remote.upload(f"nested/{rel}", parent=_id(folder))
+            for rel in ("first", "second", "third")
+        ),
+    ]
+    run, tracker = remote.persist(ops)
+    indexer = RemoteIndexer(
+        remote.drive, remote.index, target, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    indexer.refresh()
+    now = 0.0
+    moved = False
+
+    def move_after_second(response: httpx.Response) -> None:
+        nonlocal now, moved
+        if _upload(response.request) and remote.fake.find(_id(folder), "second") and not moved:
+            remote.drive.update_metadata(_id(folder), add_parent=outside, remove_parents=[target])
+            now += 1.1
+            moved = True
+
+    remote.http.event_hooks["response"].append(move_after_second)
+    report = remote.executor(
+        tracker,
+        root_id=target,
+        refresh_remote=indexer.apply_changes,
+        refresh_every=900,
+        clock=lambda: now,
+    ).execute(run, ops)
+
+    assert moved and report.done == Counter({OpKind.MKDIR: 1, OpKind.UPLOAD: 2})
+    assert report.failed == [("nested/third", "remote_changed")]
+    assert not remote.fake.find(_id(folder), "third")
+
+
+def test_fresh_resumable_create_polls_before_sending_data(remote: _Harness) -> None:
+    """A new session cannot commit under a parent moved since session initiation."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.fake.add_folder("nested", target)
+    op = remote.upload("nested/file", b"x" * (_CHUNK + 1), parent=folder)
+    run, tracker = remote.persist([op])
+    indexer = RemoteIndexer(
+        remote.drive, remote.index, target, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    indexer.refresh()
+    now = 0.0
+
+    def move_after_session(response: httpx.Response) -> None:
+        nonlocal now
+        if response.request.url.params.get("uploadType") == "resumable":
+            remote.drive.update_metadata(folder, add_parent=outside, remove_parents=[target])
+            now = 1.1
+
+    remote.http.event_hooks["response"].append(move_after_session)
+    report = remote.executor(
+        tracker, root_id=target, refresh_remote=indexer.apply_changes, clock=lambda: now
+    ).execute(run, [op])
+
+    assert now == 1.1 and report.failed == [("nested/file", "remote_changed")]
+    assert not remote.fake.find(folder, "file")
+    assert all(call.method != "PUT" for call in remote.fake.calls)
 
 
 def test_busy_content_phase_refreshes_after_operation_budget(remote: _Harness) -> None:

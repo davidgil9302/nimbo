@@ -189,6 +189,7 @@ class DriveClient:
         recover: Callable[[], _T | None] | None = None,
         before_send: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        single_attempt: bool = False,
     ) -> _T:
         if isinstance(url, str):
             url = self._api_base.join(url)
@@ -232,7 +233,7 @@ class DriveClient:
                 except httpx.TransportError as exc:
                     raise TransportFailed(type(exc).__name__) from exc
             except Unauthorized:
-                if refreshed:
+                if refreshed or single_attempt:
                     raise
                 self._tokens.invalidate()
                 refreshed = True
@@ -240,6 +241,7 @@ class DriveClient:
             except DriveError as exc:
                 should_retry = (
                     exc.retryable
+                    and not single_attempt
                     and attempt < self._retry.max_attempts
                     and (retry_http or isinstance(exc, TransportFailed))
                 )
@@ -391,8 +393,10 @@ class DriveClient:
         )
         return str(data["startPageToken"])
 
-    def changes(self, page_token: str, *, page_size: int = 1000) -> ChangesPage:
-        """Fetch one page from a token, including removals and the next available token."""
+    def changes(
+        self, page_token: str, *, page_size: int = 1000, single_attempt: bool = False
+    ) -> ChangesPage:
+        """Fetch one page with removals and the next cursor, optionally without retries."""
         data = self._request(
             "GET",
             _CHANGES,
@@ -404,6 +408,7 @@ class DriveClient:
                 "spaces": "drive",
                 "includeRemoved": "true",
             },
+            single_attempt=single_attempt,
         )
         changes = tuple(
             Change(

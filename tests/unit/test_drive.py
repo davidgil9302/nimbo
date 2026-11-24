@@ -393,6 +393,24 @@ def test_changes_page_parsing(harness: _Harness) -> None:
     assert (removed.file_id, removed.removed, removed.file) == (file_id, True, None)
 
 
+@pytest.mark.parametrize(("status", "error"), [(401, Unauthorized), (503, ServerError)])
+def test_changes_poll_sends_one_request_on_failure(
+    harness: _Harness, status: int, error: type[DriveError]
+) -> None:
+    """Leave retries to the scheduler when a one-page poll fails."""
+    token = harness.drive.start_page_token()
+    harness.fake.faults.add(
+        Fault(lambda req: req.url.path == "/drive/v3/changes", "status", status=status)
+    )
+    start = len(harness.fake.calls)
+
+    with pytest.raises(error):
+        harness.drive.changes(token, single_attempt=True)
+
+    assert [call.status for call in harness.fake.calls[start:]] == [status]
+    assert harness.sleeps == []
+
+
 def test_limiter_kinds_used(harness: _Harness) -> None:
     """Charge status queries as reads even though they are PUT requests."""
     drive, fake = harness.drive, harness.fake

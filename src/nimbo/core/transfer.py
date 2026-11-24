@@ -117,7 +117,7 @@ class _UploadData:
         source: BinaryIO,
         on_bytes: Callable[[int], None] | None,
         root_id: str | None,
-        check_create_parent: Callable[[str, str | None], bool] | None,
+        check_create_parent: Callable[[str, str | None], bool | None] | None,
     ) -> None:
         self.req = req
         self.source = source
@@ -207,7 +207,7 @@ class Uploader:
         on_bytes: Callable[[int], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         root_id: str | None = None,
-        check_create_parent: Callable[[str, str | None], bool] | None = None,
+        check_create_parent: Callable[[str, str | None], bool | None] | None = None,
     ) -> UploadOutcome:
         """Upload a scanned file, reporting newly confirmed bytes as positive deltas.
 
@@ -219,8 +219,8 @@ class Uploader:
         remote content. Local I/O and typed Drive errors propagate.
 
         A caller that revalidates names against a refreshed Drive index may
-        supply a parent checker for the first send of a new multipart create.
-        Retries, resumable transfers and updates use the regular live checks.
+        supply a parent checker for fresh creates. A None result requests live
+        validation. Retries, recovered sessions and updates use live checks.
         """
         try:
             before = req.path.lstat()
@@ -319,25 +319,6 @@ class Uploader:
         req = data.req
         content = data.read(0, req.size)
         data.confirm(req.size, content)
-        check_parent = (
-            data.check_create_parent if data.root_id is not None and not req.update else None
-        )
-
-        def before_send() -> None:
-            nonlocal check_parent
-            if check_parent is None:
-                self._before_write(data)
-                return
-            assert req.parent_id is not None
-            parent_rel = (
-                req.destination_rel.rpartition("/")[0] if req.destination_rel is not None else None
-            )
-            if not check_parent(req.parent_id, parent_rel):
-                raise RemoteChanged(req.rel)
-            self._check_path(data)
-            # A failed send may have created this ID. Revalidate it live on retry.
-            check_parent = None
-
         item = self._drive._multipart(
             data=content,
             file_id=req.file_id,
@@ -347,7 +328,7 @@ class Uploader:
             properties=req.properties,
             update=req.update,
             on_send=data.count_sent,
-            before_send=before_send,
+            before_send=self._write_guard(data, fresh=self._uses_create_checker(data)),
             should_stop=should_stop,
             validate_recovered=lambda item: self._check_recovered_upload(data, item),
         )
@@ -435,6 +416,39 @@ class Uploader:
                 raise RemoteChanged(req.rel)
         self._check_path(data)
 
+    @staticmethod
+    def _uses_create_checker(data: _UploadData) -> bool:
+        return (
+            data.root_id is not None
+            and not data.req.update
+            and data.check_create_parent is not None
+        )
+
+    def _write_guard(self, data: _UploadData, *, fresh: bool) -> Callable[[], None]:
+        """Share a fresh-create guard on the first send and recheck live on retry."""
+        check_parent = data.check_create_parent if fresh else None
+        req = data.req
+
+        def check() -> None:
+            nonlocal check_parent
+            if check_parent is not None:
+                assert req.parent_id is not None
+                parent_rel = (
+                    req.destination_rel.rpartition("/")[0]
+                    if req.destination_rel is not None
+                    else None
+                )
+                in_scope = check_parent(req.parent_id, parent_rel)
+                check_parent = None
+                if in_scope is not None:
+                    if not in_scope:
+                        raise RemoteChanged(req.rel)
+                    self._check_path(data)
+                    return
+            self._before_write(data)
+
+        return check
+
     def _resumable(
         self,
         data: _UploadData,
@@ -451,6 +465,7 @@ class Uploader:
         restarted = False
         while True:
             try:
+                fresh = saved is None and not restarted and self._uses_create_checker(data)
                 if saved is None:
                     if resume_only:
                         raise SessionExpired(req.rel)
@@ -462,7 +477,7 @@ class Uploader:
                         modified_ms=drive_ms(req.mtime_ns),
                         properties=req.properties,
                         update=req.update,
-                        before_send=lambda: self._before_write(data),
+                        before_send=self._write_guard(data, fresh=fresh),
                         should_stop=should_stop,
                     )
                     self._sessions.put_session(*key, req.file_id, url)
@@ -473,7 +488,7 @@ class Uploader:
                     position = self._drive.resumable_status(url, req.size, should_stop=should_stop)
                     if isinstance(position, RemoteFile):
                         position = self._check_completed_session(data, position)
-                item = self._send_chunks(data, url, position, should_stop)
+                item = self._send_chunks(data, url, position, should_stop, fresh=fresh)
             except SessionExpired:
                 self._sessions.delete_session(*key)
                 if restarted or resume_only:
@@ -516,6 +531,8 @@ class Uploader:
         url: str,
         position: int | RemoteFile,
         should_stop: Callable[[], bool] | None,
+        *,
+        fresh: bool,
     ) -> RemoteFile:
         size = data.req.size
         data.confirm(size if isinstance(position, RemoteFile) else position)
@@ -525,12 +542,6 @@ class Uploader:
             offset = position
             chunk = data.read(offset, min(self._chunk_size, size - offset))
             final = offset + len(chunk) == size
-
-            def before_send(final_chunk: bool = final) -> None:
-                if final_chunk:
-                    self._before_write(data)
-                else:
-                    self._check_path(data)
 
             def recover(
                 previous: int = offset, final_chunk: bool = final
@@ -550,7 +561,11 @@ class Uploader:
                 size,
                 on_send=data.count_sent,
                 recover=recover,
-                before_send=before_send,
+                before_send=(
+                    self._write_guard(data, fresh=fresh)
+                    if fresh or final
+                    else lambda: self._check_path(data)
+                ),
                 should_stop=should_stop,
             )
             data.confirm(size if isinstance(position, RemoteFile) else position, chunk)

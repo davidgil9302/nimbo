@@ -31,7 +31,7 @@ from .errors import (
     Unauthorized,
     UploadLimitExceeded,
 )
-from .index import META_FORCE_FULL, Index, TrashFile
+from .index import META_CHANGES_RELIABLE, META_CHANGES_TOKEN, META_FORCE_FULL, Index, TrashFile
 from .model import OWNER_PROPERTY, Op, OpKind, Phase, PlanIssue, RemoteFile, drive_ms, rel_join
 from .progress import ProgressTracker
 from .transfer import Uploader, UploadRequest
@@ -40,7 +40,7 @@ from .tree import RemoteTree, _rel_component
 _CREATE = {OpKind.MKDIR, OpKind.UPLOAD}
 _WITH_PARENT = _CREATE | {OpKind.MOVE}
 _UPLOAD = {OpKind.UPLOAD, OpKind.UPDATE}
-_CREATE_FOLDER_TTL = 60.0
+_CHANGE_POLL_INTERVAL = 1.0
 _PROGRESS_PHASE = {
     Phase.MKDIR: "mkdir",
     Phase.MOVE: "move",
@@ -62,30 +62,149 @@ class ExecReport:
 
 
 class _CreateFolderCache:
-    def __init__(self, drive: DriveClient, root: str, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        drive: DriveClient,
+        index: Index,
+        root: str,
+        clock: Callable[[], float],
+        refresh_requested: Event,
+    ) -> None:
         self._drive = drive
+        self._index = index
         self._root = root
         self._clock = clock
-        self._expiry: dict[tuple[str, str | None], float] = {}
+        self._refresh_requested = refresh_requested
+        self._verified: dict[str, tuple[str, float]] = {}
+        self._cursor: str | None = None
+        self._next_poll = clock() + _CHANGE_POLL_INTERVAL
+        self._first_poll_due = False
+        self._has_polled = False
+        self._blocked = False
         self._lock = Lock()
 
-    def check(self, folder: str, rel: str | None) -> bool:
-        # Serialize cache misses so parallel uploads to a folder share its check.
+    def checkpoint(self) -> None:
+        """Read the durable cursor after the scheduler refreshes the index."""
+        cursor = self._index.get_meta(META_CHANGES_TOKEN)
+        if self._index.get_meta(META_CHANGES_RELIABLE) == "0":
+            cursor = None
         with self._lock:
-            key = (folder, rel)
-            started_at = self._clock()
-            expiry = self._expiry.get(key)
-            if expiry is not None and started_at < expiry:
-                return True
-            if not self._drive.live_folder_in_subtree(folder, self._root, rel=rel):
-                self._expiry.pop(key, None)
-                return False
-            self._expiry[key] = started_at + _CREATE_FOLDER_TTL
+            if (cursor is None) != (self._cursor is None):
+                self._verified.clear()
+            self._cursor = cursor
+            self._blocked = False
+
+    def file_created(self) -> None:
+        """Check the feed on the next create after the first confirmed file write."""
+        with self._lock:
+            self._first_poll_due = not self._has_polled
+
+    def remember_directory(self, item: RemoteFile) -> None:
+        """Extend the verified path using Drive's confirmed mkdir response."""
+        if not item.is_folder or item.trashed or len(item.parents) != 1:
+            return
+        with self._lock:
+            parent = self._verified.get(item.parents[0])
+            if parent is not None:
+                rel, expires = parent
+                self._verified[item.id] = (rel_join(rel, _rel_component(item.name)), expires)
+
+    def check(self, folder: str, rel: str | None) -> bool | None:
+        """Check the creation parent, or require live checks during feed recovery."""
+        # Serialize the poll and cache misses so active uploads share their results.
+        with self._lock:
+            now = self._clock()
+            self._poll(now)
+            if self._blocked:
+                return None
+            actual = self._verify_path(folder, now)
+            return actual is not None and (rel is None or actual == rel)
+
+    def _poll(self, now: float) -> None:
+        if self._cursor is None or self._blocked:
+            return
+        if now < self._next_poll and not self._first_poll_due:
+            return
+        self._has_polled = True
+        self._first_poll_due = False
+        try:
+            page = self._drive.changes(self._cursor, single_attempt=True)
+        except DriveError:
+            self._require_refresh()
+            return
+        finally:
+            self._next_poll = self._clock() + _CHANGE_POLL_INTERVAL
+        if page.next_page_token or not page.new_start_page_token:
+            self._require_refresh()
+            return
+        self._cursor = page.new_start_page_token
+        latest: dict[str, RemoteFile | None] = {}
+        for change in page.changes:
+            if not change.removed and (change.file is None or change.file.id != change.file_id):
+                self._require_refresh()
+                return
+            latest[change.file_id] = None if change.removed else change.file
+        for file_id, live in latest.items():
+            if self._folder_changed(file_id, live):
+                self._require_refresh()
+                return
+
+    def _require_refresh(self) -> None:
+        self._verified.clear()
+        self._blocked = True
+        self._refresh_requested.set()
+
+    def _folder_changed(self, file_id: str, live: RemoteFile | None) -> bool:
+        if live is not None and live.is_folder:
+            known = self._index.get_remote(file_id)
+            if known is not None:
+                # A mkdir or move by this run is already recorded in the index.
+                return (live.name, live.parents, live.trashed, live.mime_type) != (
+                    known.name,
+                    known.parents,
+                    known.trashed,
+                    known.mime_type,
+                )
+            return (
+                file_id in self._verified
+                or file_id == self._root
+                or any(self._index.in_subtree(parent, self._root) for parent in live.parents)
+            )
+        if file_id in self._verified or file_id == self._root:
             return True
+        before = self._index.get_remote(file_id)
+        return before is not None and before.is_folder
+
+    def _verify_path(self, folder: str, now: float) -> str | None:
+        seen: set[str] = set()
+        trail: list[RemoteFile] = []
+        while folder not in seen:
+            seen.add(folder)
+            proof = self._verified.get(folder)
+            if proof is not None and (self._cursor is not None or now < proof[1]):
+                rel, expires = proof
+                break
+            item = self._drive.get(folder)
+            if item is None or item.id != folder or item.trashed or not item.is_folder:
+                return None
+            if folder == self._root:
+                rel, expires = "", now + _CHANGE_POLL_INTERVAL
+                self._verified[folder] = (rel, expires)
+                break
+            if len(item.parents) != 1:
+                return None
+            trail.append(item)
+            folder = item.parents[0]
+        else:
+            return None
+        for item in reversed(trail):
+            rel = rel_join(rel, _rel_component(item.name))
+            self._verified[item.id] = (rel, expires)
+        return rel
 
     def clear(self) -> None:
         with self._lock:
-            self._expiry.clear()
+            self._verified.clear()
 
 
 @dataclass(slots=True)
@@ -95,7 +214,7 @@ class _Run:
     planned: RemoteTree
     moving: set[str]
     unconfirmed_trash: set[int]
-    create_folder_cache: _CreateFolderCache | None
+    create_folder_cache: _CreateFolderCache | None = None
     report: ExecReport = field(default_factory=lambda: ExecReport(Counter(), 0, [], None, []))
     lock: Lock = field(default_factory=Lock)
     aborted: Event = field(default_factory=Event)
@@ -295,10 +414,11 @@ class Executor:
                 for op in self._index.inflight_ops()
                 if op.kind is OpKind.TRASH and op.db_id is not None
             },
-            _CreateFolderCache(self._drive, root, self._clock)
-            if root is not None and self._refresh_remote is not None
-            else None,
         )
+        if root is not None and self._refresh_remote is not None:
+            run.create_folder_cache = _CreateFolderCache(
+                self._drive, self._index, root, self._clock, run.refresh_requested
+            )
         for phase, pending in phases.items():
             if not run.can_start() or not self._refresh(run):
                 break
@@ -372,6 +492,8 @@ class Executor:
         run.last_refresh = self._clock()
         run.ops_since_refresh = 0
         run.refresh_requested.clear()
+        if run.create_folder_cache is not None:
+            run.create_folder_cache.checkpoint()
         if root is not None:
             run.refreshed = self._index.load_tree(root)
             run.names_by_parent.clear()
@@ -476,6 +598,10 @@ class Executor:
                 run.index_dirty = True
                 if op.kind is OpKind.MKDIR:
                     run.created_folders.add(file_id)
+                    if run.create_folder_cache is not None:
+                        run.create_folder_cache.remember_directory(item)
+                if op.kind is OpKind.UPLOAD and run.create_folder_cache is not None:
+                    run.create_folder_cache.file_created()
                 if (
                     op.kind is OpKind.MOVE
                     and item.is_folder
@@ -542,11 +668,9 @@ class Executor:
         root = self._root_id
         if root is None or parent is None:
             return
-        in_scope = (
-            cache.check(parent, op.parent_rel)
-            if cache is not None
-            else self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel)
-        )
+        in_scope = cache.check(parent, op.parent_rel) if cache is not None else None
+        if in_scope is None:
+            in_scope = self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel)
         if not in_scope:
             raise RemoteChanged
         if op.name is not None and any(
