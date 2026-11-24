@@ -23,7 +23,7 @@ class TransferRow(Horizontal):
         self._file_label = Static(
             line(rel_name(transfer.rel)), classes="transfer-name", markup=False
         )
-        self._file_label.tooltip = line(transfer.rel)
+        self._file_label.tooltip = Text(line(transfer.rel))
         self._bar = SmoothBar(motion, classes="mini-bar")
         self._percent = CountUp(motion, formatter=self._format, classes="transfer-percent")
         self._amount = Static("", classes="transfer-size", markup=False)

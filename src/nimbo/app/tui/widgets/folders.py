@@ -1,6 +1,7 @@
 """Folder summaries with stable identities for incremental updates."""
 
 from rich.cells import cell_len
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
@@ -21,7 +22,7 @@ class FolderRow(Horizontal):
         super().__init__(classes="folder-row")
         self._dot = PulseDot(motion, folder.state, classes="folder-dot")
         self._folder_label = Static(line(folder.name), classes="folder-name", markup=False)
-        self._folder_label.tooltip = line(folder.name)
+        self._folder_label.tooltip = Text(line(folder.name))
         self._bar = SmoothBar(motion, classes="mini-bar")
         self._status = Static("", classes="folder-state", markup=False)
 

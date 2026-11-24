@@ -115,10 +115,13 @@ units_failed = "Settings saved. The timer could not be updated. Check systemd an
 notice = "The last backup paused to review deletions."
 title = "Review deletions"
 description = "Confirm that these items can be moved to the Google Drive trash."
-preview_limit = "The preview shows the first 500 items. Approval applies to the entire deletion plan."
 path = "{path} · {files}"
-stale = "This approval is no longer current. Return to the dashboard and review the latest backup."
+stale = "This approval is no longer current. Review the latest backup or run `backup now` to prepare a fresh list."
 working = "Requesting backup…"
+
+[tui.confirm.items]
+one = "{count} item to move to the trash"
+other = "{count} items to move to the trash"
 
 [tui.confirm.files]
 one = "{count} file"

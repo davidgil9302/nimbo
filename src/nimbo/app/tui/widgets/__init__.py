@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from rich.text import Text
 
+from nimbo.app.context import safe_label
 from nimbo.app.fmt import human_size, relative_time
 from nimbo.app.i18n import Translator
 from nimbo.core.model import RunResult
@@ -20,13 +21,8 @@ _RUN_MARKERS = {
 
 
 def line(value: str) -> str:
-    """Display a path or label inline without terminal controls or embedded newlines."""
-    return "".join(
-        char
-        if ord(char) >= 32 and not (127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF)
-        else "�"
-        for char in value
-    )
+    """Escape nonprintable characters in paths and labels as the CLI does."""
+    return safe_label(value)
 
 
 def figure(value: str, *highlights: str, color: str = ACCENT) -> Text:

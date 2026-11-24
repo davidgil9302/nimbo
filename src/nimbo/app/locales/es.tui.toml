@@ -115,10 +115,13 @@ units_failed = "Se guardaron los ajustes. Revisa systemd y vuelve a pulsar Guard
 notice = "El último respaldo se pausó para revisar borrados."
 title = "Revisar borrados"
 description = "Confirma que estos elementos pueden enviarse a la papelera de Google Drive."
-preview_limit = "La lista muestra los primeros 500 elementos. La aprobación abarca todo el plan de borrado."
 path = "{path} · {files}"
-stale = "Esta aprobación ya no corresponde al último respaldo. Vuelve al panel para revisar el respaldo más reciente."
+stale = "Esta aprobación ya no está vigente. Revisa el último respaldo o ejecuta `backup ahora` para preparar una lista nueva."
 working = "Solicitando respaldo…"
+
+[tui.confirm.items]
+one = "{count} elemento para enviar a la papelera"
+other = "{count} elementos para enviar a la papelera"
 
 [tui.confirm.files]
 one = "{count} archivo"
