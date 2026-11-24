@@ -31,7 +31,7 @@ from .errors import (
     Unauthorized,
     UploadLimitExceeded,
 )
-from .index import META_FORCE_FULL, Index
+from .index import META_FORCE_FULL, Index, TrashFile
 from .model import OWNER_PROPERTY, Op, OpKind, Phase, PlanIssue, RemoteFile, drive_ms, rel_join
 from .progress import ProgressTracker
 from .transfer import Uploader, UploadRequest
@@ -564,7 +564,7 @@ class Executor:
         ):
             raise RemoteChanged
 
-    def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> None:
+    def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> list[TrashFile]:
         expected: dict[str, tuple[RemoteFile, str]] = {}
         pending = [(folder.id, op.rel)]
         for parent, rel in pending:
@@ -593,7 +593,11 @@ class Executor:
                 if live.is_folder:
                     folders.append(live.id)
         if not blocked:
-            return
+            return [
+                TrashFile(item.id, expected[item.id][1], item.size, item.md5)
+                for item in covered.values()
+                if not item.is_folder
+            ]
         for child_id in reversed(folders[1:]):
             if child_id in blocked:
                 blocked.add(covered[child_id].parents[0])
@@ -632,8 +636,13 @@ class Executor:
             if live is None or not _same_item(planned, live):
                 raise RemoteChanged
             self._check_live_parent(live, op.rel)
-            if live.is_folder:
+            files = (
                 self._check_folder_trash(run, op, live)
+                if live.is_folder
+                else [TrashFile(file_id, op.rel, live.size, live.md5)]
+            )
+            # Persist before sending so reconciliation can use the original metadata.
+            self._index.record_trash_files(op, files)
             sent = True
 
         try:
@@ -641,6 +650,16 @@ class Executor:
                 file_id, trashed=True, before_send=before_send, should_stop=self._stop.is_set
             )
             if item.id == file_id and item.trashed:
+                # The direct PATCH response can report a newer revision than the guard saw.
+                if (
+                    not item.is_folder
+                    and item.size is not None
+                    and item.md5 is not None
+                    and (item.size, item.md5) != (planned.size, planned.md5)
+                ):
+                    self._index.record_trash_files(
+                        op, [TrashFile(file_id, op.rel, item.size, item.md5)]
+                    )
                 return item
             raise DriveError("Drive did not confirm trash")
         except _TrashConfirmed as confirmed:

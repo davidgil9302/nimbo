@@ -7,6 +7,7 @@ import os
 import sqlite3
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -16,7 +17,7 @@ from nimbo.core.errors import NimboError
 from nimbo.core.model import FolderStat, Op, OpKind, OpState, RemoteFile, RunSummary, utc_now_iso
 from nimbo.core.tree import RemoteTree
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 META_ROOT_UUID = "root_uuid"
 META_TARGET_ID = "target_root_id"
 # Metadata key for the Drive changes cursor.
@@ -72,6 +73,13 @@ _MIGRATIONS = {
           files_local INTEGER NOT NULL DEFAULT 0, bytes_local INTEGER NOT NULL DEFAULT 0,
           files_pending INTEGER NOT NULL DEFAULT 0, bytes_pending INTEGER NOT NULL DEFAULT 0,
           updated_at TEXT)
+        """,
+    ),
+    2: (
+        "ALTER TABLE trash_log ADD COLUMN op_id INTEGER REFERENCES op(id)",
+        """
+        CREATE TABLE trash_file (op_id INTEGER NOT NULL REFERENCES op(id), file_id TEXT NOT NULL,
+          rel TEXT NOT NULL, size INTEGER, md5 TEXT, PRIMARY KEY (op_id, file_id))
         """,
     ),
 }
@@ -150,6 +158,16 @@ def _op_row(row: sqlite3.Row) -> Op:
         disk_rel=row["disk_rel"],
         db_id=row["id"],
     )
+
+
+@dataclass(frozen=True, slots=True)
+class TrashFile:
+    """Identify a covered file and its path, size and digest observed at trash time."""
+
+    file_id: str
+    rel: str
+    size: int | None
+    md5: str | None
 
 
 class Index:
@@ -498,6 +516,20 @@ class Index:
         with self._transaction(write=True):
             self._update_op(op, OpState.INFLIGHT, increment_attempts=True)
 
+    def record_trash_files(self, op: Op, files: Sequence[TrashFile]) -> None:
+        """Replace the observed file snapshots for a persisted trash intent.
+
+        Raise ValueError if the operation has no journal ID.
+        """
+        if op.db_id is None:
+            raise ValueError("A persisted operation ID is required")
+        with self._transaction(write=True):
+            self._execute("DELETE FROM trash_file WHERE op_id = ?", (op.db_id,))
+            self._executemany(
+                "INSERT INTO trash_file (op_id, file_id, rel, size, md5) VALUES (?, ?, ?, ?, ?)",
+                ((op.db_id, file.file_id, file.rel, file.size, file.md5) for file in files),
+            )
+
     def complete_op(
         self,
         op: Op,
@@ -522,10 +554,10 @@ class Index:
                 if op.file_id is None:
                     raise ValueError("A Drive file ID is required for the trash log")
                 self._execute(
-                    "INSERT INTO trash_log (run_id, file_id, rel, is_folder) VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT(run_id, file_id) DO UPDATE SET rel=excluded.rel, "
-                    "is_folder=excluded.is_folder",
-                    (trash_log_run, op.file_id, op.rel, trashed_is_folder),
+                    "INSERT INTO trash_log (run_id, file_id, rel, is_folder, op_id) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, file_id) DO UPDATE SET "
+                    "rel=excluded.rel, is_folder=excluded.is_folder, op_id=excluded.op_id",
+                    (trash_log_run, op.file_id, op.rel, trashed_is_folder, op.db_id),
                 )
 
     def fail_op(self, op: Op, error_code: str) -> None:
@@ -574,6 +606,20 @@ class Index:
                 (run_id,),
             )
             return [(row["file_id"], row["rel"], bool(row["is_folder"])) for row in rows]
+
+    def trash_files(self, run_id: int) -> dict[str, TrashFile]:
+        """Return the latest confirmed trash snapshot per Drive ID for a run."""
+        with self._transaction():
+            rows = self._execute(
+                "SELECT file.file_id, file.rel, file.size, file.md5 "
+                "FROM trash_log AS log JOIN trash_file AS file ON file.op_id = log.op_id "
+                "WHERE log.run_id = ? ORDER BY file.op_id",
+                (run_id,),
+            )
+            return {
+                row["file_id"]: TrashFile(row["file_id"], row["rel"], row["size"], row["md5"])
+                for row in rows
+            }
 
     def last_run_with_trash(self) -> int | None:
         """Return the newest run ID with a trash log, including unfinished runs."""

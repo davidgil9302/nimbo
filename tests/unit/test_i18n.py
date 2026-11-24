@@ -169,6 +169,7 @@ def test_every_reason_code_has_text():
             "local_unreadable",
             "remote_changed",
             "remote_missing",
+            "changed_since_trash",
             "folder-kept-protected",
             "folder_ratio",
             "too_many_deletes",

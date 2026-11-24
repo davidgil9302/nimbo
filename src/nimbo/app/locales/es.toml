@@ -65,6 +65,7 @@ db_readonly = "El índice local es de solo lectura. Revisa que tu cuenta pueda e
 run_history_damaged = "El índice local contiene un registro de ejecución dañado. Ejecuta backup diagnostico para revisarlo."
 remote_changed = "Un elemento cambió en Drive durante el respaldo. Revisa los pendientes y vuelve a respaldar."
 remote_missing = "Un elemento ya no está disponible en Drive. Revisa si se movió, si está en la papelera o si cambió su acceso."
+changed_since_trash = "El contenido cambió desde que Nimbo lo envió a la papelera. Se guardó la copia actual de Drive."
 local_vanished = "Un archivo desapareció de tu computadora durante el respaldo. Revisa su ubicación y vuelve a intentarlo."
 local_unreadable = "No se pudo leer un archivo en tu computadora. Revisa sus permisos y vuelve a intentarlo."
 file_in_use = "Un archivo seguía cambiando durante el respaldo. Guarda los cambios, cierra el archivo y vuelve a intentarlo."

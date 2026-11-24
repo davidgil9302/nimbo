@@ -32,6 +32,7 @@ from .index import (
     META_ROOT_UUID,
     META_TARGET_ID,
     Index,
+    TrashFile,
 )
 from .lock import RunLock
 from .model import (
@@ -620,7 +621,8 @@ class Engine:
     def undo(self, run_id: int | None = None, *, stop: Event | None = None) -> UndoSummary:
         """Untrash a run's logged items and restore missing paths beneath the source root.
 
-        Use the latest trash log by default. Record per-item failures and skips.
+        Use the latest trash log by default. Record per-item failures and skips,
+        including content changes since trash even when the download succeeds.
         Raise LockedError on contention or Stopped on cancellation. Propagate
         source preflight or refresh failures.
         """
@@ -651,6 +653,8 @@ class Engine:
         stop: Event,
     ) -> UndoSummary:
         deps = self._deps
+        assert summary.run_id is not None
+        snapshots = deps.index.trash_files(summary.run_id)
         target = deps.cfg.target.folder_id
         target_item = deps.drive.get(target)
         if target_item is None or target_item.trashed or not target_item.is_folder:
@@ -675,7 +679,7 @@ class Engine:
         self._reset_target()
         self._indexer(stop).refresh()
         for rel, item in restored:
-            self._restore_tree(root_fd, rel, item, root_uuid, summary, stop)
+            self._restore_tree(root_fd, rel, item, root_uuid, summary, snapshots, stop)
         return summary
 
     def _check_restore_scope(self, item: RemoteFile, root_uuid: str, stop: Event) -> None:
@@ -706,6 +710,7 @@ class Engine:
         item: RemoteFile,
         root_uuid: str,
         summary: UndoSummary,
+        snapshots: dict[str, TrashFile],
         stop: Event,
     ) -> None:
         deps = self._deps
@@ -745,6 +750,13 @@ class Engine:
                             summary.skipped_existing.append(rel)
                         else:
                             summary.restored_files += 1
+                            # The downloader already verified the bytes against item metadata.
+                            snapshot = snapshots.get(item.id)
+                            if snapshot is not None and (
+                                (snapshot.size is not None and item.size != snapshot.size)
+                                or (snapshot.md5 is not None and item.md5 != snapshot.md5)
+                            ):
+                                summary.failed.append((rel, "changed_since_trash"))
                 if item.is_folder:
                     children = sorted(
                         deps.drive.list_children([item.id]),

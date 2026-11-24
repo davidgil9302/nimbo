@@ -20,7 +20,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from nimbo.core.errors import NimboError
-from nimbo.core.index import META_CHANGES_TOKEN, SCHEMA_VERSION, Index
+from nimbo.core.index import _MIGRATIONS, META_CHANGES_TOKEN, SCHEMA_VERSION, Index
 from nimbo.core.model import (
     FOLDER_MIME,
     FolderStat,
@@ -113,6 +113,29 @@ def test_migration_failure_rolls_back_schema_and_version(db_path: Path) -> None:
     with closing(sqlite3.connect(db_path)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         assert connection.execute("SELECT name FROM sqlite_master").fetchall() == [("op",)]
+
+
+def test_migrate_v1_preserves_trash_log_without_inventing_file_snapshots(db_path: Path) -> None:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
+        for statement in _MIGRATIONS[1]:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 1")
+        connection.execute(
+            "INSERT INTO run (id, trigger, started_at) VALUES (1, 'manual', ?)", (STARTED,)
+        )
+        connection.executemany(
+            "INSERT INTO trash_log VALUES (?, ?, ?, ?)",
+            [(1, "file", "Photos/report", 0), (1, "folder", "Photos/old", 1)],
+        )
+
+    with closing(Index(db_path)) as index:
+        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert index.last_run_with_trash() == 1
+        assert index.trash_log(1) == [
+            ("file", "Photos/report", False),
+            ("folder", "Photos/old", True),
+        ]
+        assert index.trash_files(1) == {}
 
 
 def test_meta_set_get_delete(db: Index) -> None:

@@ -475,6 +475,56 @@ def test_undo_restores_local_files_and_untrashes(mirror: _Harness) -> None:
     mirror.assert_mirror()
 
 
+@pytest.mark.parametrize(
+    ("rel", "later"),
+    [("Docs/report", b"revised!"), ("Docs/old/deeper/report", b"later revision")],
+)
+def test_undo_reports_changed_content_and_keeps_download(
+    mirror: _Harness, rel: str, later: bytes
+) -> None:
+    path = mirror.put(rel, b"original")
+    mirror.run()
+    tree = mirror.index.load_tree(mirror.target).by_rel()
+    [item] = tree[rel]
+    path.unlink()
+    trash_target = item
+    if path.parent != mirror.root / "Docs":
+        path.parent.rmdir()
+        path.parent.parent.rmdir()
+        [trash_target] = tree["Docs/old"]
+    trashed = mirror.run()
+    assert trashed.trashed == 1
+    assert mirror.fake.file(item.id).trashed
+    mirror.deps.drive.update_metadata(trash_target.id, trashed=False)
+    mirror.fake.set_content(item.id, later)
+
+    restored = mirror.engine.undo(trashed.run_id)
+
+    assert restored.restored_files == 1
+    assert path.read_bytes() == later
+    assert restored.failed == [(rel, "changed_since_trash")]
+
+
+def test_undo_without_trash_snapshot_uses_legacy_behavior(mirror: _Harness) -> None:
+    rel = "Docs/report"
+    path = mirror.put(rel, b"original")
+    mirror.run()
+    [item] = mirror.index.load_tree(mirror.target).by_rel()[rel]
+    path.unlink()
+    run_id = mirror.index.start_run("manual", _DAY.isoformat())
+    op = Op(OpKind.TRASH, rel, "deleted-locally", file_id=item.id, affected_files=1)
+    mirror.index.save_ops(run_id, [op])
+    mirror.deps.drive.update_metadata(item.id, trashed=True)
+    mirror.index.complete_op(op, remove_subtrees=[item.id], trash_log_run=run_id)
+    mirror.deps.drive.update_metadata(item.id, trashed=False)
+    mirror.fake.set_content(item.id, b"later revision")
+
+    restored = mirror.engine.undo(run_id)
+
+    assert restored.restored_files == 1 and restored.failed == []
+    assert path.read_bytes() == b"later revision"
+
+
 def test_undo_never_overwrites(mirror: _Harness) -> None:
     path = mirror.put("Docs/replaced", b"old")
     mirror.run()
@@ -891,6 +941,30 @@ def test_trash_crash_window_still_undoable(mirror: _Harness, preview_first: bool
     assert undone.restored_files == 1
     assert path.read_bytes() == b"restore"
     assert not mirror.fake.file(item.id).trashed
+
+
+def test_reconciled_folder_trash_uses_snapshot_from_before_crash(mirror: _Harness) -> None:
+    rel = "Docs/old/deeper/report"
+    path = mirror.put(rel, b"original")
+    mirror.run()
+    [item] = mirror.index.load_tree(mirror.target).by_rel()[rel]
+    path.unlink()
+    path.parent.rmdir()
+    path.parent.parent.rmdir()
+    mirror.fake.faults.add(Fault(_patch, "crash_after"))
+    with pytest.raises(SimulatedCrash):
+        mirror.run()
+    assert mirror.fake.file(item.id).trashed
+
+    mirror.fake.set_content(item.id, b"later revision")
+    mirror.reopen()
+    mirror.engine.preview()
+    reconciled = mirror.run()
+    restored = mirror.engine.undo(reconciled.run_id)
+
+    assert restored.restored_files == 1
+    assert path.read_bytes() == b"later revision"
+    assert restored.failed == [(rel, "changed_since_trash")]
 
 
 def test_undo_refuses_symlink_parent_and_traversing_remote_name(

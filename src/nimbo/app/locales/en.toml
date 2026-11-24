@@ -65,6 +65,7 @@ db_readonly = "The local index is read-only. Check that your account can write t
 run_history_damaged = "The local index contains a damaged run record. Run backup diagnostico to check it."
 remote_changed = "An item changed in Drive during the backup. Review the pending changes and run the backup again."
 remote_missing = "An item is no longer available in Drive. Check whether it was moved, sent to the trash, or its access changed."
+changed_since_trash = "The content changed after Nimbo moved it to the trash. The current Drive copy was saved."
 local_vanished = "A file disappeared from your computer during the backup. Check its location and try again."
 local_unreadable = "A file couldn't be read on your computer. Check its permissions and try again."
 file_in_use = "A file kept changing during the backup. Save your changes, close the file, and try again."

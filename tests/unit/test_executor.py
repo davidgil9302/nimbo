@@ -501,10 +501,11 @@ def test_index_updated_after_each_op(remote: _Harness) -> None:
 
 
 def test_trash_logged_for_undo(remote: _Harness) -> None:
-    """Remove a whole subtree from the index and log the explicit trash targets."""
+    """Log explicit trash targets and snapshot every covered file by its Drive ID."""
     root = remote.fake.root_id
     folder = remote.fake.add_folder("folder")
-    child = remote.fake.add_file("child", folder, b"keep in trash")
+    sub = remote.fake.add_folder("sub", folder)
+    child = remote.fake.add_file("child", sub, b"keep in trash")
     file_id = remote.fake.add_file("file", root, b"keep too")
     ops = [_trash("folder", folder), _trash("file", file_id)]
     run, tracker = remote.persist(ops)
@@ -512,10 +513,40 @@ def test_trash_logged_for_undo(remote: _Harness) -> None:
 
     remote.reopen()
     assert remote.index.trash_log(run) == [(folder, "folder", True), (file_id, "file", False)]
+    assert {
+        (file_id, snapshot.rel, snapshot.size, snapshot.md5)
+        for file_id, snapshot in remote.index.trash_files(run).items()
+    } == {
+        (child, "folder/sub/child", 13, md5(b"keep in trash", usedforsecurity=False).hexdigest()),
+        (file_id, "file", 8, md5(b"keep too", usedforsecurity=False).hexdigest()),
+    }
     assert remote.index.remote_count() == 0
     assert remote.fake.file(child).content == b"keep in trash"
     assert remote.fake.file(child).trashed
     remote.check_mirror()
+
+
+def test_trash_uses_confirmed_direct_file_metadata(remote: _Harness) -> None:
+    """Use the confirmed revision when a file changes between the guard and the PATCH."""
+    file_id = remote.fake.add_file("report", remote.fake.root_id, b"original")
+    op = _trash("report", file_id)
+    run, tracker = remote.persist([op])
+
+    def edit_at_patch(request: httpx.Request) -> bool:
+        if not _metadata(file_id)(request):
+            return False
+        remote.fake.set_content(file_id, b"new")
+        return True
+
+    remote.fake.faults.add(Fault(edit_at_patch, "delay"))
+    report = remote.executor(tracker).execute(run, [op])
+
+    assert report.failed == []
+    snapshot = remote.index.trash_files(run)[file_id]
+    assert (snapshot.size, snapshot.md5) == (
+        3,
+        md5(b"new", usedforsecurity=False).hexdigest(),
+    )
 
 
 @pytest.mark.parametrize("break_cycle", [False, True])
