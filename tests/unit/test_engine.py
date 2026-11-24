@@ -357,9 +357,10 @@ def test_approved_folder_trash_reports_items_added_during_walk(
     mirror.fake.set_content(added["Docs/Old/Late/binary"], b"edited on Drive")
     restored = mirror.engine.undo(summary.run_id)
 
-    assert restored.untrashed == 1 and restored.restored_files == 2
-    assert ("Docs/Old/Late/binary", "changed_since_trash") in restored.failed
-    assert (mirror.root / "Docs/Old/Late/binary").read_bytes() == b"edited on Drive"
+    assert restored.untrashed == 1 and restored.restored_files == 1
+    assert ("Docs/Old/Late", "not_backed_up") in restored.failed
+    assert not (mirror.root / "Docs/Old/Late").exists()
+    assert mirror.fake.file(added["Docs/Old/Late/binary"]).content == b"edited on Drive"
     assert not mirror.fake.file(added["Docs/Old/Document"]).trashed
     assert planned.read_bytes() == b"planned"
 
@@ -379,7 +380,7 @@ def test_folder_trash_without_unexpected_items_stays_ok(mirror: _Harness) -> Non
     summary = mirror.run()
 
     assert summary.trashed == 1 and summary.warnings == [] and summary.failed == []
-    assert set(mirror.index.trash_files(summary.run_id)) == {item.id}
+    assert set(mirror.index.trash_files(summary.run_id)) == {old.id, item.id}
     restored = mirror.engine.undo(summary.run_id)
     assert restored.restored_files == 1 and restored.failed == []
     assert mirror.fake.file(descendant).trashed
@@ -593,7 +594,7 @@ def test_undo_restores_local_files_and_untrashes(mirror: _Harness) -> None:
     ("rel", "later"),
     [("Docs/report", b"revised!"), ("Docs/old/deeper/report", b"later revision")],
 )
-def test_undo_reports_changed_content_and_keeps_download(
+def test_undo_reports_changed_content_and_leaves_it_in_drive(
     mirror: _Harness, rel: str, later: bytes
 ) -> None:
     path = mirror.put(rel, b"original")
@@ -614,12 +615,13 @@ def test_undo_reports_changed_content_and_keeps_download(
 
     restored = mirror.engine.undo(trashed.run_id)
 
-    assert restored.restored_files == 1
-    assert path.read_bytes() == later
-    assert restored.failed == [(rel, "changed_since_trash")]
+    assert restored.restored_files == 0
+    assert not path.exists()
+    assert mirror.fake.file(item.id).content == later
+    assert restored.failed == [(rel, "changed_since_backup")]
 
 
-def test_undo_without_trash_snapshot_uses_legacy_behavior(mirror: _Harness) -> None:
+def test_undo_without_trash_snapshot_only_restores_in_drive(mirror: _Harness) -> None:
     rel = "Docs/report"
     path = mirror.put(rel, b"original")
     mirror.run()
@@ -635,8 +637,9 @@ def test_undo_without_trash_snapshot_uses_legacy_behavior(mirror: _Harness) -> N
 
     restored = mirror.engine.undo(run_id)
 
-    assert restored.restored_files == 1 and restored.failed == []
-    assert path.read_bytes() == b"later revision"
+    assert restored.restored_files == 0 and restored.failed == [(rel, "not_backed_up")]
+    assert not path.exists()
+    assert mirror.fake.file(item.id).content == b"later revision"
 
 
 def test_undo_never_overwrites(mirror: _Harness) -> None:
@@ -1076,9 +1079,11 @@ def test_reconciled_folder_trash_uses_snapshot_from_before_crash(mirror: _Harnes
     reconciled = mirror.run()
     restored = mirror.engine.undo(reconciled.run_id)
 
-    assert restored.restored_files == 1
-    assert path.read_bytes() == b"later revision"
-    assert restored.failed == [(rel, "changed_since_trash")]
+    assert restored.restored_files == 0
+    assert not path.exists()
+    assert not mirror.fake.file(item.id).trashed
+    assert mirror.fake.file(item.id).content == b"later revision"
+    assert restored.failed == [(rel, "changed_since_backup")]
 
 
 def test_undo_refuses_symlink_parent_and_traversing_remote_name(

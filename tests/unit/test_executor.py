@@ -502,7 +502,7 @@ def test_index_updated_after_each_op(remote: _Harness) -> None:
 
 
 def test_trash_logged_for_undo(remote: _Harness) -> None:
-    """Log explicit trash targets and snapshot every covered file by its Drive ID."""
+    """Log explicit trash targets and snapshot every covered item by its Drive ID."""
     root = remote.fake.root_id
     folder = remote.fake.add_folder("folder")
     sub = remote.fake.add_folder("sub", folder)
@@ -518,6 +518,8 @@ def test_trash_logged_for_undo(remote: _Harness) -> None:
         (file_id, snapshot.rel, snapshot.size, snapshot.md5)
         for file_id, snapshot in remote.index.trash_files(run).items()
     } == {
+        (folder, "folder", None, None),
+        (sub, "folder/sub", None, None),
         (child, "folder/sub/child", 13, md5(b"keep in trash", usedforsecurity=False).hexdigest()),
         (file_id, "file", 8, md5(b"keep too", usedforsecurity=False).hexdigest()),
     }

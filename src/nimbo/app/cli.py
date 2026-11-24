@@ -692,13 +692,6 @@ def _approve(paths: Paths, cfg: Config, t: Translator, console: Console, *, yes:
 
 
 def _undo(paths: Paths, cfg: Config, t: Translator, console: Console, run_id: int | None) -> int:
-    if paths.db_file.exists():
-        with closing(Index.open_readonly(paths.db_file)) as index:
-            bound = index.get_meta(wizard.META_UNDO_BOUNDARY)
-            if bound is not None:
-                selected = run_id if run_id is not None else index.last_run_with_trash()
-                if selected is not None and selected <= int(bound):
-                    raise NimboError(code="cli.undo_other_mirror")
     engine, close = build_engine(paths, cfg)
     with _close_after(close), _stop_on_signal() as stop:
         summary = engine.undo(run_id, stop=stop)

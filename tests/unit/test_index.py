@@ -26,7 +26,6 @@ from nimbo.core.index import (
     META_FORCE_FULL,
     SCHEMA_VERSION,
     Index,
-    TrashFile,
 )
 from nimbo.core.model import (
     FOLDER_MIME,
@@ -155,8 +154,9 @@ def test_migrate_v2_preserves_trash_snapshots(
             run_id = index.start_run("manual", STARTED)
             op = Op(OpKind.TRASH, "Photos/old", "deleted-locally", file_id="folder")
             index.save_ops(run_id, [op])
-            index.record_trash_files(
-                op, [TrashFile("file", "Photos/old/report", 10, "recorded-md5")]
+            index._connection.execute(
+                "INSERT INTO trash_file (op_id, file_id, rel, size, md5) VALUES (?, ?, ?, ?, ?)",
+                (op.db_id, "file", "Photos/old/report", 10, "recorded-md5"),
             )
             index._connection.execute(
                 "INSERT INTO trash_log (run_id, file_id, rel, is_folder, op_id) "
@@ -173,6 +173,7 @@ def test_migrate_v2_preserves_trash_snapshots(
             10,
             "recorded-md5",
         )
+        assert not snapshot.owned_by_mirror and snapshot.backup_md5 is None
 
 
 def test_migrate_v3_refreshes_unknown_ownership(db_path: Path) -> None:

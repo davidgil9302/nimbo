@@ -378,7 +378,9 @@ def _audit_folder_trash(
             seen.add(child.id)
             rel = rel_join(group[child.parents[0]], _rel_component(child.name))
             if child.id not in guarded:
-                unexpected.append(TrashFile(child.id, rel, child.size, child.md5))
+                unexpected.append(
+                    TrashFile(child.id, rel, child.size, child.md5, is_folder=child.is_folder)
+                )
             if child.is_folder:
                 pending.append((child.id, rel))
     return sorted(unexpected, key=lambda item: (item.rel, item.file_id))
@@ -637,7 +639,7 @@ class Executor:
         while True:
             try:
                 self._check_index(run, op, file_id)
-                item, uploaded = self._apply(run, work, file_id)
+                item, uploaded, backup_md5 = self._apply(run, work, file_id)
                 additions = []
                 if op.kind is OpKind.TRASH and item.is_folder:
                     # If the listing fails, keep the confirmed write open for reconciliation.
@@ -684,7 +686,12 @@ class Executor:
                     )
                 else:
                     self._index.complete_op(
-                        op, upsert=[item], local_md5=item.md5 if op.kind in _UPLOAD else None
+                        op,
+                        upsert=[item],
+                        local_md5=backup_md5 if op.kind in _UPLOAD else None,
+                        backed_up=(item.id, item.size, backup_md5)
+                        if item.size is not None and backup_md5 is not None
+                        else None,
                     )
                 run.report.done[op.kind] += 1
                 run.report.uploaded_bytes += uploaded
@@ -793,6 +800,16 @@ class Executor:
         ):
             raise RemoteChanged
 
+    def _trash_file(self, item: RemoteFile, rel: str) -> TrashFile:
+        return TrashFile(
+            item.id,
+            rel,
+            item.size,
+            item.md5,
+            owned_by_mirror=item.owned_by_me is True and item.owner_root == self._root_uuid,
+            is_folder=item.is_folder,
+        )
+
     def _check_folder_trash(self, run: _Run, op: Op, folder: RemoteFile) -> None:
         expected: dict[str, tuple[RemoteFile, str]] = {}
         pending = [(folder.id, op.rel)]
@@ -832,9 +849,8 @@ class Executor:
             self._index.record_trash_files(
                 op,
                 [
-                    TrashFile(item.id, expected[item.id][1], item.size, item.md5)
-                    for item in covered.values()
-                    if not item.is_folder
+                    self._trash_file(folder, op.rel),
+                    *(self._trash_file(item, expected[item.id][1]) for item in covered.values()),
                 ],
                 guarded_ids=covered.keys(),
             )
@@ -896,9 +912,7 @@ class Executor:
             if live.is_folder:
                 self._check_folder_trash(run, op, live)
             else:
-                self._index.record_trash_files(
-                    op, [TrashFile(file_id, op.rel, live.size, live.md5)]
-                )
+                self._index.record_trash_files(op, [self._trash_file(live, op.rel)])
             sent = True
 
         try:
@@ -906,16 +920,10 @@ class Executor:
                 file_id, trashed=True, before_send=before_send, should_stop=self._stop.is_set
             )
             if item.id == file_id and item.trashed:
-                # The direct PATCH response can report a newer revision than the guard saw.
-                if (
-                    not item.is_folder
-                    and item.size is not None
-                    and item.md5 is not None
-                    and (item.size, item.md5) != (planned.size, planned.md5)
-                ):
-                    self._index.record_trash_files(
-                        op, [TrashFile(file_id, op.rel, item.size, item.md5)]
-                    )
+                # The direct response may have newer metadata than the guard saw.
+                confirmed = self._trash_file(item, op.rel)
+                if confirmed != self._trash_file(planned, op.rel):
+                    self._index.confirm_trash_file(op, confirmed)
                 return item
             raise DriveError("Drive did not confirm trash")
         except _TrashConfirmed as confirmed:
@@ -935,14 +943,14 @@ class Executor:
                     work.trash_uncertain = live is None
             raise
 
-    def _apply(self, run: _Run, work: _Work, file_id: str) -> tuple[RemoteFile, int]:
+    def _apply(self, run: _Run, work: _Work, file_id: str) -> tuple[RemoteFile, int, str | None]:
         op = work.op
         if op.kind in _UPLOAD:
             # A deferred or retried operation may already have created its Drive ID.
             cache = run.create_folder_cache if not (work.deferrals or work.md5_retries) else None
             return self._upload(op, file_id, run.planned.get(file_id), cache)
         if op.kind is OpKind.TRASH:
-            return self._trash(run, work, file_id), 0
+            return self._trash(run, work, file_id), 0, None
         stop = self._stop.is_set
 
         def check_metadata() -> None:
@@ -1015,11 +1023,23 @@ class Executor:
                 before_send=check_metadata,
                 should_stop=stop,
             )
-        return item, 0
+        previous = run.planned.get(file_id)
+        # TOUCH also adopts an unmanaged file when its bytes match but its mtime differs.
+        adopted = (
+            op.kind in (OpKind.ADOPT, OpKind.TOUCH)
+            and op.md5 is not None
+            and previous is not None
+            and previous.owner_root is None
+            and previous.md5 == op.md5
+            and item.id == file_id
+            and item.owner_root == self._root_uuid
+            and (item.size, item.md5) == (previous.size, op.md5)
+        )
+        return item, 0, op.md5 if adopted else None
 
     def _upload(
         self, op: Op, file_id: str, planned: RemoteFile | None, cache: _CreateFolderCache | None
-    ) -> tuple[RemoteFile, int]:
+    ) -> tuple[RemoteFile, int, str]:
         def on_bytes(delta: int) -> None:
             try:
                 self._tracker.transfer(op.rel, delta, op.size)
@@ -1059,7 +1079,7 @@ class Executor:
             raise _LocalReadError(code="local_vanished") from exc
         except OSError as exc:
             raise _LocalReadError(code="local_unreadable") from exc
-        return outcome.file, outcome.bytes_sent
+        return outcome.file, outcome.bytes_sent, outcome.local_md5
 
     def _failure(self, run: _Run, work: _Work, error: NimboError) -> _Retry | None:
         op = work.op

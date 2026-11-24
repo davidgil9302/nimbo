@@ -55,6 +55,7 @@ from nimbo.core.index import (
     META_TARGET_ID,
     Index,
 )
+from nimbo.core.index import META_UNDO_BOUNDARY as META_UNDO_BOUNDARY
 from nimbo.core.lock import RunLock
 from nimbo.core.model import nfc
 from nimbo.core.paths import Paths
@@ -70,7 +71,6 @@ _CLIENT = re.compile(r"[A-Za-z0-9_-]+\.apps\.googleusercontent\.com")
 _SECRET = re.compile(r"[A-Za-z0-9_-]+")
 _TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _LAUNCHER = "systemd-launch.sh"
-META_UNDO_BOUNDARY = "cli_undo_boundary"
 _LOG_FILE = re.compile(r"nimbo-[0-9]{4}-[0-9]{2}-[0-9]{2}\.jsonl")
 
 

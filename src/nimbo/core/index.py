@@ -17,7 +17,7 @@ from nimbo.core.errors import NimboError
 from nimbo.core.model import FolderStat, Op, OpKind, OpState, RemoteFile, RunSummary, utc_now_iso
 from nimbo.core.tree import RemoteTree
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 META_ROOT_UUID = "root_uuid"
 META_TARGET_ID = "target_root_id"
 # Metadata key for the Drive changes cursor.
@@ -30,6 +30,7 @@ META_QUOTA_USED = "quota_used"
 META_QUOTA_LIMIT = "quota_limit"
 META_ACCOUNT = "account_email"
 META_LAST_DEEP = "last_deep_compare"
+META_UNDO_BOUNDARY = "cli_undo_boundary"
 
 _MIGRATIONS = {
     1: (
@@ -86,6 +87,14 @@ _MIGRATIONS = {
     4: (
         "ALTER TABLE remote ADD COLUMN owned_by_me INTEGER",
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_full_listing', '1')",
+    ),
+    5: (
+        "CREATE TABLE backup_file (file_id TEXT PRIMARY KEY, size INTEGER NOT NULL, "
+        "md5 TEXT NOT NULL)",
+        "ALTER TABLE trash_file ADD COLUMN owned_by_mirror INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE trash_file ADD COLUMN is_folder INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE trash_file ADD COLUMN backup_size INTEGER",
+        "ALTER TABLE trash_file ADD COLUMN backup_md5 TEXT",
     ),
 }
 
@@ -172,12 +181,17 @@ def _op_row(row: sqlite3.Row) -> Op:
 
 @dataclass(frozen=True, slots=True)
 class TrashFile:
-    """Identify a covered Drive item by its path and any size and digest at trash time."""
+    """Identify a covered item and its ownership, metadata, and backup at trash time."""
 
     file_id: str
     rel: str
     size: int | None
     md5: str | None
+    owned_by_mirror: bool = False
+    is_folder: bool = False
+    backup_size: int | None = None
+    backup_md5: str | None = None
+    reason: str | None = None
 
 
 class Index:
@@ -557,9 +571,35 @@ class Index:
 
     def _insert_trash_files(self, op: Op, files: Sequence[TrashFile]) -> None:
         self._executemany(
-            "INSERT INTO trash_file (op_id, file_id, rel, size, md5) VALUES (?, ?, ?, ?, ?)",
-            ((op.db_id, file.file_id, file.rel, file.size, file.md5) for file in files),
+            """
+            INSERT INTO trash_file (op_id, file_id, rel, size, md5, owned_by_mirror,
+                                    is_folder, backup_size, backup_md5)
+            SELECT ?, item.file_id, ?, ?, ?, ?, ?, backup.size, backup.md5
+            FROM (SELECT ? AS file_id) AS item
+            LEFT JOIN backup_file AS backup ON backup.file_id = item.file_id
+            """,
+            (
+                (
+                    op.db_id,
+                    file.rel,
+                    file.size,
+                    file.md5,
+                    file.owned_by_mirror,
+                    file.is_folder,
+                    file.file_id,
+                )
+                for file in files
+            ),
         )
+
+    def confirm_trash_file(self, op: Op, item: TrashFile) -> None:
+        """Refresh the guarded root item's metadata from the direct trash response."""
+        with self._transaction(write=True):
+            self._execute(
+                "UPDATE trash_file SET size = ?, md5 = ?, owned_by_mirror = ? "
+                "WHERE op_id = ? AND file_id = ?",
+                (item.size, item.md5, item.owned_by_mirror, op.db_id, item.file_id),
+            )
 
     def guarded_trash_ids(self, op: Op) -> set[str] | None:
         """Return the folder guard's observed descendant IDs, or None if it wasn't recorded."""
@@ -577,6 +617,7 @@ class Index:
         trashed_is_folder: bool = False,
         trash_additions: Sequence[TrashFile] = (),
         local_md5: str | None = None,
+        backed_up: tuple[str, int, str] | None = None,
     ) -> None:
         """Mark an operation done with its mirror, trash log and verified digest changes.
 
@@ -589,6 +630,12 @@ class Index:
             self._delete_remote(remove_subtrees)
             if local_md5 is not None:
                 self._put_hash(op.rel, op.size, op.mtime_ns, local_md5)
+            if backed_up is not None:
+                self._execute(
+                    "INSERT INTO backup_file (file_id, size, md5) VALUES (?, ?, ?) "
+                    "ON CONFLICT(file_id) DO UPDATE SET size=excluded.size, md5=excluded.md5",
+                    backed_up,
+                )
             if trash_log_run is not None:
                 if op.file_id is None:
                     raise ValueError("A Drive file ID is required for the trash log")
@@ -650,17 +697,35 @@ class Index:
 
     def trash_files(self, run_id: int) -> dict[str, TrashFile]:
         """Return the latest confirmed trash snapshot per Drive ID for a run."""
+        return {
+            file_id: item
+            for group in self.undo_snapshots(run_id).values()
+            for file_id, item in group.items()
+        }
+
+    def undo_snapshots(self, run_id: int) -> dict[str, dict[str, TrashFile]]:
+        """Return confirmed snapshots grouped by the explicitly trashed Drive ID."""
         with self._transaction():
             rows = self._execute(
-                "SELECT file.file_id, file.rel, file.size, file.md5 "
+                "SELECT log.file_id AS trash_root, file.*, op.reason "
                 "FROM trash_log AS log JOIN trash_file AS file ON file.op_id = log.op_id "
-                "WHERE log.run_id = ? ORDER BY file.op_id",
+                "JOIN op ON op.id = log.op_id WHERE log.run_id = ? ORDER BY file.op_id",
                 (run_id,),
             )
-            return {
-                row["file_id"]: TrashFile(row["file_id"], row["rel"], row["size"], row["md5"])
-                for row in rows
-            }
+            snapshots: dict[str, dict[str, TrashFile]] = {}
+            for row in rows:
+                snapshots.setdefault(row["trash_root"], {})[row["file_id"]] = TrashFile(
+                    row["file_id"],
+                    row["rel"],
+                    row["size"],
+                    row["md5"],
+                    bool(row["owned_by_mirror"]),
+                    bool(row["is_folder"]),
+                    row["backup_size"],
+                    row["backup_md5"],
+                    row["reason"],
+                )
+            return snapshots
 
     def last_run_with_trash(self) -> int | None:
         """Return the newest run ID with a trash log, including unfinished runs."""

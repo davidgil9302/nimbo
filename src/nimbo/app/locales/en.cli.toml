@@ -28,7 +28,6 @@ undo_line = "Untrashed {untrashed} · files restored {restored} · existing file
 hooks_ignored = "Ignoring test overrides because the Drive origin must start with http://127.0.0.1 or http://localhost and include a port."
 oauth_hook_ignored = "Ignoring the OAuth test override because its origin must use a local address and port."
 unsafe_path = "A Nimbo state file points outside its configured directory. Review the symbolic link before continuing."
-undo_other_mirror = "That run belongs to an earlier mirror setup. Review the old destination in Drive."
 version_line = "nimbo {version}"
 
 [cli.parser]

@@ -9,7 +9,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Static
 from textual.worker import Worker
 
-from nimbo.core.errors import LockedError
+from nimbo.core.errors import LockedError, NimboError
 from nimbo.core.lock import is_locked
 from nimbo.core.model import RunSummary, UndoSummary
 
@@ -224,7 +224,9 @@ class UndoScreen(Panel[UndoSummary]):
             app.refresh_snapshot()
 
         def failed(exc: Exception) -> None:
-            self._confirm.disabled = False
+            self._confirm.disabled = (
+                isinstance(exc, NimboError) and exc.code == "cli.undo_other_mirror"
+            )
             self._status.update(error_text(self.t, exc, "tui.error.undo"))
 
         self._worker = self.start_job(work, finished, failed)

@@ -6,7 +6,7 @@ import logging
 import os
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,7 +16,7 @@ from typing import Protocol
 from .allocate import allocate
 from .config import Config
 from .drive import DriveClient
-from .errors import AuthError, LockedError, NimboError, Stopped
+from .errors import AuthError, LockedError, Md5Mismatch, NimboError, Stopped
 from .executor import TRASH_TOOK_NEW_ITEMS, ExecReport, Executor, _audit_folder_trash
 from .hasher import LocalHasher
 from .index import (
@@ -31,12 +31,14 @@ from .index import (
     META_QUOTA_USED,
     META_ROOT_UUID,
     META_TARGET_ID,
+    META_UNDO_BOUNDARY,
     Index,
     TrashFile,
 )
 from .lock import RunLock
 from .model import (
     FOREIGN_ITEM_KEPT,
+    INVALID_NAME_PREFIX,
     About,
     AuditReport,
     FolderStat,
@@ -149,7 +151,10 @@ def _internal_error(summary: RunSummary) -> None:
 
 def _restore_parts(rel: str) -> tuple[str, ...]:
     parts = tuple(rel.split("/"))
-    if any(part in ("", ".", "..") or "\x00" in part for part in parts):
+    if any(
+        part in ("", ".", "..") or "\x00" in part or part.startswith(INVALID_NAME_PREFIX)
+        for part in parts
+    ):
         raise NimboError(code="unsafe_restore_path")
     return parts
 
@@ -162,6 +167,24 @@ def _restore_name(parent_fd: int, component: str) -> str:
     return matches[0] if matches else canonical
 
 
+def _open_restore_dir(parent_fd: int, name: str) -> tuple[int, bool]:
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd), False
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            return os.open(name, _DIR_FLAGS, dir_fd=parent_fd), False
+
+    # O_PATH can pin the new directory even when the umask removed owner access.
+    created_fd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        Path(f"/proc/self/fd/{created_fd}").chmod(0o700)
+        return os.open(".", _DIR_FLAGS, dir_fd=created_fd), True
+    finally:
+        os.close(created_fd)
+
+
 @contextmanager
 def _restore_parent(root_fd: int, rel: str) -> Iterator[tuple[int, str]]:
     parts = _restore_parts(rel)
@@ -171,12 +194,7 @@ def _restore_parent(root_fd: int, rel: str) -> Iterator[tuple[int, str]]:
     try:
         for component in parts[:-1]:
             name = _restore_name(parent_fd, component)
-            try:
-                child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
-            except FileNotFoundError:
-                with suppress(FileExistsError):
-                    os.mkdir(name, dir_fd=parent_fd)
-                child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+            child_fd, _ = _open_restore_dir(parent_fd, name)
             os.close(parent_fd)
             parent_fd = child_fd
         yield parent_fd, _restore_name(parent_fd, parts[-1])
@@ -654,8 +672,8 @@ class Engine:
     def undo(self, run_id: int | None = None, *, stop: Event | None = None) -> UndoSummary:
         """Untrash a run's logged items and restore missing paths beneath the source root.
 
-        Use the latest trash log by default. Record per-item failures and skips,
-        including content changes since trash even when the download succeeds.
+        Use the latest trash log by default. Refuse runs from an earlier mirror setup.
+        Restore local content only when it matches a journaled backup of a local deletion.
         Raise LockedError on contention or Stopped on cancellation. Propagate
         source preflight or refresh failures.
         """
@@ -664,6 +682,9 @@ class Engine:
         with RunLock(deps.paths.lock_file):
             if run_id is None:
                 run_id = deps.index.last_run_with_trash()
+            boundary = deps.index.get_meta(META_UNDO_BOUNDARY)
+            if run_id is not None and boundary is not None and run_id <= int(boundary):
+                raise NimboError(code="cli.undo_other_mirror")
             summary = UndoSummary(run_id)
             records = [] if run_id is None else deps.index.trash_log(run_id)
             if not records:
@@ -687,7 +708,7 @@ class Engine:
     ) -> UndoSummary:
         deps = self._deps
         assert summary.run_id is not None
-        snapshots = deps.index.trash_files(summary.run_id)
+        snapshots = deps.index.undo_snapshots(summary.run_id)
         target = deps.cfg.target.folder_id
         target_item = deps.drive.get(target)
         if target_item is None or target_item.trashed or not target_item.is_folder:
@@ -697,10 +718,12 @@ class Engine:
             _check_stop(stop)
             try:
                 item = deps.drive.get(file_id)
-                if item is None:
+                if item is None or item.id != file_id:
                     raise NimboError(code="remote_missing")
                 self._check_restore_scope(item, root_uuid, stop)
                 item = deps.drive.update_metadata(file_id, trashed=False)
+                if item.id != file_id or item.trashed:
+                    raise NimboError(code="unsafe_restore_target")
             except Stopped:
                 raise
             except NimboError as exc:
@@ -712,7 +735,9 @@ class Engine:
         self._reset_target()
         self._indexer(stop).refresh()
         for rel, item in restored:
-            self._restore_tree(root_fd, rel, item, root_uuid, summary, snapshots, stop)
+            self._restore_tree(
+                root_fd, rel, item, root_uuid, summary, snapshots.get(item.id, {}), stop
+            )
         return summary
 
     def _check_restore_scope(self, item: RemoteFile, root_uuid: str, stop: Event) -> None:
@@ -758,19 +783,35 @@ class Engine:
             _check_stop(stop)
             rel, item = pending.pop()
             try:
-                if item.id in seen or item.trashed or item.is_google_native:
+                if item.id in seen or item.trashed:
                     raise NimboError(code="unsafe_restore_target")
                 seen.add(item.id)
+                snapshot = snapshots.get(item.id)
+                if (
+                    snapshot is None
+                    or not snapshot.owned_by_mirror
+                    or (not item.is_folder and snapshot.backup_md5 is None)
+                ):
+                    raise NimboError(code="not_backed_up")
+                if snapshot.reason != "deleted-locally":
+                    raise NimboError(code="not_deleted_locally")
                 if item.owner_root not in (None, root_uuid):
                     raise NimboError(code="foreign-owner")
+                if item.is_google_native or (rel, item.is_folder) != (
+                    snapshot.rel,
+                    snapshot.is_folder,
+                ):
+                    raise NimboError(code="unsafe_restore_target")
+                if not item.is_folder and (item.size, item.md5) != (
+                    snapshot.backup_size,
+                    snapshot.backup_md5,
+                ):
+                    raise NimboError(code="changed_since_backup")
                 with _restore_parent(root_fd, rel) as (parent_fd, name):
                     if item.is_folder:
-                        try:
-                            os.mkdir(name, dir_fd=parent_fd)
-                        except FileExistsError:
-                            # Reuse only an actual directory, never a symlink or file.
-                            os.close(os.open(name, _DIR_FLAGS, dir_fd=parent_fd))
-                        else:
+                        folder_fd, created = _open_restore_dir(parent_fd, name)
+                        os.close(folder_fd)
+                        if created:
                             folders.append((rel, item.modified_ms))
                     else:
                         # Pin the directory used for exclusive download staging and publish.
@@ -781,15 +822,10 @@ class Engine:
                             if not os.path.lexists(dest):
                                 raise
                             summary.skipped_existing.append(rel)
+                        except Md5Mismatch as exc:
+                            raise NimboError(code="changed_since_backup") from exc
                         else:
                             summary.restored_files += 1
-                            # The downloader already verified the bytes against item metadata.
-                            snapshot = snapshots.get(item.id)
-                            if snapshot is not None and (
-                                (snapshot.size is not None and item.size != snapshot.size)
-                                or (snapshot.md5 is not None and item.md5 != snapshot.md5)
-                            ):
-                                summary.failed.append((rel, "changed_since_trash"))
                 if item.is_folder:
                     children = sorted(
                         deps.drive.list_children([item.id]),

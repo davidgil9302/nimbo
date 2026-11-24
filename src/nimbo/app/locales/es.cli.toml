@@ -28,7 +28,6 @@ undo_line = "Recuperados de la papelera {untrashed} · archivos restaurados {res
 hooks_ignored = "Se ignoraron los ajustes de prueba porque la dirección de Drive debe comenzar con http://127.0.0.1 o http://localhost e incluir un puerto."
 oauth_hook_ignored = "Se ignoró el ajuste OAuth de prueba porque su dirección debe ser local e incluir un puerto."
 unsafe_path = "Un archivo de estado de Nimbo apunta fuera del directorio configurado. Revisa el enlace simbólico antes de continuar."
-undo_other_mirror = "Esa ejecución pertenece a una configuración anterior. Revisa el destino anterior en Drive."
 version_line = "nimbo {version}"
 
 [cli.parser]

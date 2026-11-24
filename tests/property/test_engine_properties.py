@@ -21,15 +21,18 @@ from hypothesis.stateful import (
     run_state_machine_as_test,
 )
 
-from nimbo.core.model import OpKind, RunResult
+from nimbo.core.model import OWNER_PROPERTY, OpKind, OpState, RunResult, nfc, rel_parent
+from nimbo.core.safety import read_sentinel
 from tests.fakedrive import FakeFile, Fault, FaultPlan, SimulatedCrash
 from tests.system.helpers import (
+    ANCHOR,
     CHUNK_SIZE,
     LOCAL_ACTIONS,
     MULTIPART_MAX,
     REMOTE_ACTIONS,
     SMALL_TREE,
     EngineSession,
+    View,
     assert_no_duplicates,
     assert_ok,
     assert_untouched,
@@ -60,9 +63,14 @@ class EngineMachine(RuleBasedStateMachine):
         )
         self.serial = 0
         self.synced = False
+        self.owner = read_sentinel(self.mirror.root)
+        assert self.owner is not None
+        self.observed_run = 0
+        self.backed_up: dict[str, tuple[int, str]] = {}
         self.undo_run: int | None = None
         self.undo_items: dict[str, FakeFile] = {}
         self.undo_roots: dict[str, str] = {}
+        self.undo_failures: dict[str, str] = {}
 
     def teardown(self) -> None:
         """Release the isolated files after Hypothesis finishes this example."""
@@ -82,6 +90,27 @@ class EngineMachine(RuleBasedStateMachine):
         with self.mirror.open() as external:
             if remote_noise(self.mirror, external.drive, action, Random(seed), self.serial):
                 self.synced = False
+
+    @precondition(lambda self: self.synced)
+    @rule(seed=_SEED)
+    def edit_drive_before_local_delete(self, seed: int) -> None:
+        """Edit a backed-up Drive file, then remove its source before the next backup."""
+        mirror = self.mirror
+        paths = {
+            nfc(path.relative_to(mirror.root).as_posix()): path
+            for path in (mirror.root / "Docs").rglob("*")
+            if path.is_file()
+        }
+        candidates = [
+            (rel, item)
+            for rel, item in live_items(mirror.fake, mirror.target).items()
+            if rel != ANCHOR and rel in paths and item.id in self.backed_up
+        ]
+        if candidates:
+            rel, item = Random(seed).choice(candidates)
+            mirror.fake.set_content(item.id, item.content + b"\x00")
+            paths[rel].unlink()
+            self.synced = False
 
     @rule()
     def backup(self) -> None:
@@ -126,6 +155,8 @@ class EngineMachine(RuleBasedStateMachine):
     def undo_last_deletions(self) -> None:
         """Restore the last journaled deletions and verify their bytes and original IDs."""
         mirror = self.mirror
+        matcher = mirror.config.matcher()
+        folders = mirror.config.active_folders
         with mirror.open() as session:
             assert session.index.last_run_with_trash() == self.undo_run
             live = {
@@ -137,29 +168,49 @@ class EngineMachine(RuleBasedStateMachine):
                 for rel, file_id in self.undo_roots.items()
                 if mirror.fake.file(file_id).parent_id in live
             }
-            expected = {
+            expected_remote = {
                 rel: item
                 for rel, item in self.undo_items.items()
                 if any(rel == root or rel.startswith(f"{root}/") for root in allowed)
             }
+            drive_only = {
+                rel: code for rel, code in self.undo_failures.items() if rel in expected_remote
+            }
+            expected_local = {
+                rel: item
+                for rel, item in expected_remote.items()
+                if not any(rel == path or rel.startswith(f"{path}/") for path in drive_only)
+            }
+            before_local = local_view(mirror.root, matcher, folders)
+            blocked = self.undo_roots.keys() - allowed
             summary = session.engine.undo()
             assert summary.run_id == self.undo_run
-            assert summary.failed == [
-                (rel, "unsafe_restore_target") for rel in sorted(self.undo_roots.keys() - allowed)
-            ], summary
+            scope_failures = [(rel, "unsafe_restore_target") for rel in sorted(blocked)]
+            assert summary.failed[: len(scope_failures)] == scope_failures, summary
+            local_failures = summary.failed[len(scope_failures) :]
+            assert sorted(local_failures) == sorted(drive_only.items()), summary
             assert not summary.skipped_existing, summary
             assert summary.untrashed == len(allowed), summary
-            assert summary.restored_files == sum(item.is_binary for item in expected.values())
-            local = local_view(mirror.root, mirror.config.matcher(), mirror.config.active_folders)
-            for rel, before in expected.items():
+            assert summary.restored_files == sum(item.is_binary for item in expected_local.values())
+            for before in expected_remote.values():
                 assert mirror.fake.file(before.id) == before
-                assert local.get(rel) == (before.is_folder, before.size or 0, before.md5), rel
-            for rel in self.undo_roots.keys() - allowed:
+            assert not before_local.keys() & expected_remote.keys()
+            restored_view = {
+                rel: (item.is_folder, item.size or 0, item.md5)
+                for rel, item in expected_local.items()
+            }
+            for rel in expected_local:
+                parent = rel_parent(rel)
+                while parent and parent not in before_local and parent not in restored_view:
+                    restored_view[parent] = True, 0, None
+                    parent = rel_parent(parent)
+            assert local_view(mirror.root, matcher, folders) == before_local | restored_view
+            for rel in blocked:
                 assert mirror.fake.file(self.undo_roots[rel]).trashed
             self.undo_run = None
             self.undo_roots.clear()
             self.undo_items.clear()
-            # Restored items from other Drive clients may be adopted on this backup.
+            self.undo_failures.clear()
             self._finish_backup(session, self._remote_before())
 
     @invariant()
@@ -174,6 +225,51 @@ class EngineMachine(RuleBasedStateMachine):
             for rel, item in live_items(self.mirror.fake, self.mirror.target).items()
         }
 
+    def _observe_completed_ops(
+        self,
+        session: EngineSession,
+        run_id: int,
+        before: dict[str, tuple[str, FakeFile]],
+        local: View,
+    ) -> dict[str, str]:
+        # The source view is the same for the interrupted run and its recovery.
+        # Take digests from the source instead of the undo snapshots or Drive.
+        trash_reasons = {}
+        for journal_run in range(self.observed_run + 1, run_id + 1):
+            for op, state, _ in session.index.op_states(journal_run):
+                if state is not OpState.DONE or op.file_id is None:
+                    continue
+                if op.kind is OpKind.TRASH:
+                    trash_reasons[op.file_id] = op.reason
+                    continue
+                previous = before.get(op.file_id)
+                adopted = (
+                    op.kind in (OpKind.ADOPT, OpKind.TOUCH)
+                    and previous is not None
+                    and OWNER_PROPERTY not in previous[1].properties
+                )
+                if op.kind in (OpKind.UPLOAD, OpKind.UPDATE) or adopted:
+                    is_folder, size, md5 = local[op.rel]
+                    if not is_folder:
+                        assert md5 is not None
+                        self.backed_up[op.file_id] = size, md5
+        self.observed_run = run_id
+        return trash_reasons
+
+    def _undo_failure(self, item: FakeFile, trash_reason: str) -> str | None:
+        backup = self.backed_up.get(item.id)
+        if (
+            item.owned_by_me is not True
+            or item.properties.get(OWNER_PROPERTY) != self.owner
+            or (item.is_binary and backup is None)
+        ):
+            return "not_backed_up"
+        if trash_reason != "deleted-locally":
+            return "not_deleted_locally"
+        if item.is_binary and (item.size, item.md5) != backup:
+            return "changed_since_backup"
+        return None
+
     def _finish_backup(
         self, session: EngineSession, before: dict[str, tuple[str, FakeFile]]
     ) -> None:
@@ -185,23 +281,32 @@ class EngineMachine(RuleBasedStateMachine):
         assert result.run_id is not None
         mirror.assert_state()
         assert local_view(mirror.root, matcher, folders) == expected
+        trash_reasons = self._observe_completed_ops(session, result.run_id, before, expected)
         records = session.index.trash_log(result.run_id)
         if records:
             self.undo_run = result.run_id
             self.undo_roots = {rel: file_id for file_id, rel, _ in records}
             self.undo_items = {}
+            self.undo_failures = {}
             for file_id, rel, is_folder in records:
                 original_rel, item = before[file_id]
                 assert (rel, is_folder) == (original_rel, item.is_folder)
                 assert mirror.fake.file(file_id) == replace(
                     item, trashed=True, explicitly_trashed=True
                 )
-                self.undo_items[rel] = item
+                covered = [(rel, item)]
                 if is_folder:
                     for child_rel, child in before.values():
                         if child_rel.startswith(f"{rel}/") and mirror.fake.file(child.id).trashed:
                             assert mirror.fake.file(child.id) == replace(child, trashed=True)
-                            self.undo_items[child_rel] = child
+                            covered.append((child_rel, child))
+                self.undo_items.update(covered)
+                for path, child in sorted(covered, key=lambda pair: pair[0]):
+                    if any(path.startswith(f"{parent}/") for parent in self.undo_failures):
+                        continue
+                    code = self._undo_failure(child, trash_reasons[file_id])
+                    if code is not None:
+                        self.undo_failures[path] = code
         mirror.assert_idempotent(session.engine)
         self.synced = True
 
@@ -211,6 +316,22 @@ def test_engine_state_machine(tmp_path: Path, caplog: pytest.LogCaptureFixture) 
     caplog.set_level(logging.WARNING, logger="httpx")
     # Hypothesis documents support for factory functions alongside state machine classes.
     run_state_machine_as_test(lambda: EngineMachine(tmp_path), settings=settings())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("reason", ["not_backed_up", "changed_since_backup"])
+def test_state_machine_undo_restores_drive_only(tmp_path: Path, reason: str) -> None:
+    machine = EngineMachine(tmp_path)
+    try:
+        machine.backup()
+        if reason == "not_backed_up":
+            machine.drive_noise(action="extra", seed=0)
+        else:
+            machine.edit_drive_before_local_delete(seed=0)
+        machine.backup()
+        assert list(machine.undo_failures.values()) == [reason]
+        machine.undo_last_deletions()
+    finally:
+        machine.teardown()
 
 
 def test_remote_edit_with_same_size_and_mtime_converges(
