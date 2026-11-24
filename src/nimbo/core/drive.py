@@ -8,7 +8,8 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol, TypeVar
 from urllib.parse import quote
@@ -23,6 +24,7 @@ from .errors import (
     Forbidden,
     NotFound,
     RateLimited,
+    RemoteChanged,
     ServerError,
     SessionExpired,
     Stopped,
@@ -31,7 +33,16 @@ from .errors import (
     Unauthorized,
     UploadLimitExceeded,
 )
-from .model import FILE_FIELDS, FOLDER_MIME, About, Change, ChangesPage, RemoteFile, rfc3339_from_ms
+from .model import (
+    FILE_FIELDS,
+    FOLDER_MIME,
+    FOREIGN_ITEM_KEPT,
+    About,
+    Change,
+    ChangesPage,
+    RemoteFile,
+    rfc3339_from_ms,
+)
 from .ratelimit import RateLimiter, RetryPolicy, parse_retry_after
 from .tree import _rel_component
 
@@ -56,6 +67,18 @@ class TokenProvider(Protocol):
 
     def invalidate(self) -> None:
         """Require the next token lookup to refresh the token."""
+
+
+class ForeignItemKept(RemoteChanged):
+    """The live item or an ancestor is protected from this mirror's writes."""
+
+    code = FOREIGN_ITEM_KEPT
+
+
+class ForeignTarget(ForeignItemKept):
+    """The target itself is marked for another mirror."""
+
+    code = "foreign-owner"
 
 
 def _raise_for(response: httpx.Response, *, session: bool = False) -> NoReturn:
@@ -172,6 +195,9 @@ class DriveClient:
         self._api_base = httpx.URL(api_base.rstrip("/"))
         self._rng = random.SystemRandom() if rng is None else rng
         self._sleep = sleep
+        self._upload_scope: ContextVar[tuple[str, str] | None] = ContextVar(
+            "upload_scope", default=None
+        )
 
     def _request(
         self,
@@ -312,7 +338,7 @@ class DriveClient:
     def get(self, file_id: str) -> RemoteFile | None:
         """Fetch one file's metadata, returning None for HTTP 404."""
         try:
-            return self._request(
+            item = self._request(
                 "GET",
                 f"{_FILES}/{quote(file_id, safe='')}",
                 _read_file,
@@ -320,9 +346,26 @@ class DriveClient:
             )
         except NotFound:
             return None
+        if (scope := self._upload_scope.get()) is not None:
+            root_id, root_uuid = scope
+            if root_id in (file_id, item.id):
+                if item.owner_root not in (None, root_uuid):
+                    raise ForeignTarget
+            elif item.protected_from(root_uuid):
+                raise ForeignItemKept
+        return item
+
+    @contextmanager
+    def guard_upload_scope(self, root_id: str, root_uuid: str) -> Iterator[None]:
+        """Enforce ownership in the uploader's live reads, including recovery and retries."""
+        token = self._upload_scope.set((root_id, root_uuid))
+        try:
+            yield
+        finally:
+            self._upload_scope.reset(token)
 
     def live_folder_in_subtree(
-        self, folder_id: str, root_id: str, *, rel: str | None = None
+        self, folder_id: str, root_id: str, *, rel: str | None = None, root_uuid: str | None = None
     ) -> bool:
         """Check current parent links and, when given, the expected relative path."""
         seen: set[str] = set()
@@ -333,7 +376,11 @@ class DriveClient:
             if folder is None or folder.trashed or not folder.is_folder:
                 break
             if folder.id == root_id or folder_id == root_id:
+                if root_uuid is not None and folder.owner_root not in (None, root_uuid):
+                    raise ForeignTarget
                 return rel is None or "/".join(reversed(names)) == rel
+            if root_uuid is not None and folder.protected_from(root_uuid):
+                raise ForeignItemKept
             if len(folder.parents) != 1:
                 break
             names.append(_rel_component(folder.name))
@@ -363,15 +410,21 @@ class DriveClient:
             "spaces": "drive",
             "pageSize": page_size,
         }
-        return self._child_pages(params)
+        return (RemoteFile.from_api(item) for item in self._file_pages(params))
 
-    def _child_pages(self, params: dict[str, str | int]) -> Iterator[RemoteFile]:
+    def _file_pages(
+        self, params: dict[str, str | int], *, should_stop: Callable[[], bool] | None = None
+    ) -> Iterator[dict[str, Any]]:
+        seen: set[str] = set()
         while True:
-            data = self._request("GET", _FILES, _read_json, params=params)
-            for item in data.get("files", ()):
-                yield RemoteFile.from_api(item)
-            if not (token := data.get("nextPageToken")):
+            data = self._request("GET", _FILES, _read_json, params=params, should_stop=should_stop)
+            token = data.get("nextPageToken")
+            if token and token in seen:
+                raise DriveError("Drive repeated a file listing page token")
+            yield from data.get("files", ())
+            if not token:
                 return
+            seen.add(token)
             params["pageToken"] = token
 
     def generate_ids(self, count: int) -> list[str]:

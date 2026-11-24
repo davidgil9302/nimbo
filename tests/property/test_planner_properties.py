@@ -249,19 +249,23 @@ def test_protected_subtrees_are_untouched(case: Scenario) -> None:
 
 
 @given(scenarios(), st.integers(min_value=0, max_value=50))
-def test_foreign_owner_returns_error_without_operations(case: Scenario, index: int) -> None:
-    """A foreign owner anywhere within scope stops all planned operations."""
+def test_foreign_owner_preserves_physical_branch(case: Scenario, index: int) -> None:
+    """A foreign tag protects the item and its physical descendants."""
     in_scope = [
         (rel, item)
         for rel, item in RemoteTree(ROOT, case.remote.values()).walk()
         if rel_top(rel) in FOLDERS
     ]
     rel, item = in_scope[index % len(in_scope)]
-    remote = {**case.remote, item.id: replace(item, properties={OWNER_PROPERTY: "foreign"})}
-    plan = _plan(replace(case, remote=remote))
-    assert [(error.code, error.rel) for error in plan.errors] == [("foreign-owner", rel)]
-    assert plan.is_empty
-    assert plan.stats.total_ops == 0
+    foreign = replace(item, properties={OWNER_PROPERTY: "foreign"}, owned_by_me=True)
+    case = replace(case, remote={**case.remote, item.id: foreign})
+    plan = _plan(case)
+    assert PlanIssue("foreign-item-kept", rel) in plan.warnings
+    before = RemoteTree(ROOT, case.remote.values())
+    after = RemoteTree(ROOT, _apply(case, plan).values())
+    for protected in (foreign, *before.descendants(foreign.id)):
+        assert after.get(protected.id) == protected
+        assert after.rel_of(protected.id) == before.rel_of(protected.id)
 
 
 @given(scenarios())

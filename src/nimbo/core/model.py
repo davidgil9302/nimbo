@@ -29,11 +29,12 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
 OWNER_PROPERTY = "nimbo"  # Drive `properties` key; value = source-root UUID
+FOREIGN_ITEM_KEPT = "foreign-item-kept"
 SENTINEL_NAME = ".nimbo-root"  # marker file at the source root
 PART_SUFFIX = ".nimbo-part"  # temporary suffix for downloads in progress
 NOBACKUP_NAME = ".nobackup"  # a directory containing this file is excluded
 INVALID_NAME_PREFIX = "\x00"  # rel component for remote names that cannot exist locally
-FILE_FIELDS = "id,name,mimeType,parents,size,md5Checksum,modifiedTime,properties,trashed"
+FILE_FIELDS = "id,name,mimeType,parents,size,md5Checksum,modifiedTime,properties,trashed,ownedByMe"
 MAX_DRIVE_MS = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z
 EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"
 
@@ -143,6 +144,7 @@ class RemoteFile:
     modified_ms: int | None = None
     properties: Mapping[str, str] = field(default_factory=dict)
     trashed: bool = False
+    owned_by_me: bool | None = None
 
     @property
     def is_folder(self) -> bool:
@@ -161,6 +163,9 @@ class RemoteFile:
     def owner_root(self) -> str | None:
         return self.properties.get(OWNER_PROPERTY)
 
+    def protected_from(self, root_uuid: str) -> bool:
+        return self.owned_by_me is False or self.owner_root not in (None, root_uuid)
+
     @classmethod
     def from_api(cls, data: Mapping[str, Any]) -> RemoteFile:
         """Parse a Drive v3 ``File`` resource (only the fields in ``FILE_FIELDS``)."""
@@ -168,6 +173,7 @@ class RemoteFile:
         md5 = data.get("md5Checksum")
         modified = data.get("modifiedTime")
         props = data.get("properties") or {}
+        owned = data.get("ownedByMe")
         return cls(
             id=str(data["id"]),
             name=str(data.get("name", "")),
@@ -178,6 +184,7 @@ class RemoteFile:
             modified_ms=ms_from_rfc3339(str(modified)) if modified else None,
             properties={str(k): str(v) for k, v in props.items()},
             trashed=bool(data.get("trashed", False)),
+            owned_by_me=owned if isinstance(owned, bool) else None,
         )
 
 
@@ -303,7 +310,7 @@ class PlanStats:
     trashes: int = 0
     trashed_files: int = 0
     per_folder_trashed: dict[str, int] = field(default_factory=dict)
-    per_folder_remote_files: dict[str, int] = field(default_factory=dict)
+    per_folder_remote_files: dict[str, int] = field(default_factory=dict)  # owned, managed files
     per_folder_pending_files: dict[str, int] = field(default_factory=dict)
     per_folder_pending_bytes: dict[str, int] = field(default_factory=dict)
 

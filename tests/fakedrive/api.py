@@ -96,6 +96,8 @@ class FakeDrive:
         *,
         device: bool = False,
         properties: Mapping[str, str] | None = None,
+        modified_ms: int | None = None,
+        owned_by_me: bool | None = True,
     ) -> str:
         """Seed a folder and return its ID, raising a Drive error for an invalid parent."""
         with self._state.lock:
@@ -105,6 +107,8 @@ class FakeDrive:
                 FOLDER_MIME,
                 properties=properties,
                 device=device,
+                modified_ms=modified_ms,
+                owned_by_me=owned_by_me,
             )
 
     def add_file(
@@ -116,6 +120,7 @@ class FakeDrive:
         modified_ms: int | None = None,
         properties: Mapping[str, str] | None = None,
         mime_type: str = BINARY_MIME,
+        owned_by_me: bool | None = True,
     ) -> str:
         """Seed a binary file and return its ID, raising ValueError for native MIME types."""
         if mime_type.startswith(GOOGLE_APPS_PREFIX):
@@ -128,16 +133,22 @@ class FakeDrive:
                 content=content,
                 modified_ms=modified_ms,
                 properties=properties,
+                owned_by_me=owned_by_me,
             )
 
     def add_native(
-        self, name: str, parent: str, mime_type: str = "application/vnd.google-apps.document"
+        self,
+        name: str,
+        parent: str,
+        mime_type: str = "application/vnd.google-apps.document",
+        *,
+        owned_by_me: bool | None = True,
     ) -> str:
         """Seed a native Drive file with no media and return its ID."""
         if not mime_type.startswith(GOOGLE_APPS_PREFIX) or mime_type == FOLDER_MIME:
             raise ValueError("Expected a native Google Drive file MIME type")
         with self._state.lock:
-            return self._state.seed(name, parent, mime_type)
+            return self._state.seed(name, parent, mime_type, owned_by_me=owned_by_me)
 
     def set_content(self, file_id: str, content: bytes, *, keep_modified: bool = True) -> None:
         """Replace fixture bytes. Raise KeyError for absent IDs or ValueError for native files."""

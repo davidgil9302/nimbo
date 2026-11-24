@@ -36,6 +36,7 @@ from .index import (
 )
 from .lock import RunLock
 from .model import (
+    FOREIGN_ITEM_KEPT,
     About,
     AuditReport,
     FolderStat,
@@ -401,6 +402,7 @@ class Engine:
         self._reset_target()
         _phase(progress, "listing")
         self._reconcile(summary, stop)
+        previous = index.load_tree(cfg.target.folder_id)
         indexer = self._indexer(stop)
         try:
             indexer.refresh()
@@ -434,6 +436,13 @@ class Engine:
         _phase(progress, "planning")
         deep = force_deep or self._deep_due()
         hasher = LocalHasher(cfg.source.root, index, should_stop=stop.is_set)
+
+        def mapped_id(rel: str, candidates: set[str]) -> str | None:
+            known = [file_id for file_id in candidates if previous.rel_of(file_id) == rel]
+            if len(known) == 1:
+                return known[0]
+            return index.last_written_id(rel, candidates)
+
         plan = make_plan(
             scanned.entries,
             index.load_tree(cfg.target.folder_id),
@@ -441,6 +450,7 @@ class Engine:
             lambda entry: hasher.md5(entry, force=deep),
             PlannerOptions(cfg.active_folders, root_uuid, deep, tuple(scanned.protected)),
             verify_same_metadata=True,
+            mapped_id=mapped_id,
         )
         _check_stop(stop)
         return _Prepared(root_uuid, about, indexer, scanned, plan, deep)
@@ -491,7 +501,12 @@ class Engine:
             raise _PreflightError(problem_space.code, problem_space.detail, result=RunResult.FAILED)
 
         _check_stop(stop)
-        allocate(plan, deps.cfg.target.folder_id, deps.drive.generate_ids, self._reuse_upload_id)
+        allocate(
+            plan,
+            deps.cfg.target.folder_id,
+            deps.drive.generate_ids,
+            lambda op: self._reuse_upload_id(op, prepared.root_uuid),
+        )
         _check_stop(stop)
         deps.index.save_ops(run_id, plan.ops)
         executor = Executor(
@@ -522,7 +537,7 @@ class Engine:
             deps.index.prune_hashes(keep=prepared.scanned.entries.keys())
         deps.index.prune_sessions(older_than=(now - _WEEK).isoformat())
 
-    def _reuse_upload_id(self, op: Op) -> str | None:
+    def _reuse_upload_id(self, op: Op, root_uuid: str) -> str | None:
         if op.kind is OpKind.UPLOAD and op.parent_id is not None:
             key = (op.rel, op.size, op.mtime_ns, create_session_kind(op.parent_id))
             session = self._deps.index.get_session(*key)
@@ -532,6 +547,7 @@ class Engine:
                 if item is None or (
                     not item.trashed
                     and not item.is_folder
+                    and not item.protected_from(root_uuid)
                     and item.parents == (op.parent_id,)
                     and item.name == op.name
                 ):
@@ -543,7 +559,7 @@ class Engine:
 
     @staticmethod
     def _record_report(summary: RunSummary, report: ExecReport) -> None:
-        summary.warnings.extend(report.warnings)
+        summary.warnings = list(dict.fromkeys([*summary.warnings, *report.warnings]))
         summary.mkdirs = report.done[OpKind.MKDIR]
         summary.uploaded = report.done[OpKind.UPLOAD]
         summary.uploaded_bytes = report.uploaded_bytes
@@ -559,7 +575,9 @@ class Engine:
                 "cancelled": RunResult.CANCELLED,
                 "upload_limit_exceeded": RunResult.PAUSED,
             }.get(report.stop_reason, RunResult.FAILED)
-        elif report.failed or any(issue.code == TRASH_TOOK_NEW_ITEMS for issue in summary.warnings):
+        elif report.failed or any(
+            issue.code in (FOREIGN_ITEM_KEPT, TRASH_TOOK_NEW_ITEMS) for issue in summary.warnings
+        ):
             summary.result = RunResult.PARTIAL
         else:
             summary.result = RunResult.OK
@@ -581,6 +599,11 @@ class Engine:
         pending_files = Counter(planned.per_folder_pending_files)
         pending_bytes = Counter(planned.per_folder_pending_bytes)
         failed_folders = {rel_top(problem.rel) for problem in prepared.scanned.problems}
+        failed_folders.update(
+            rel_top(issue.rel)
+            for issue in prepared.plan.warnings
+            if issue.code == FOREIGN_ITEM_KEPT
+        )
         if summary is not None and summary.run_id is not None:
             for op, state, _ in index.op_states(summary.run_id):
                 folder = rel_top(op.rel)

@@ -12,7 +12,7 @@ from enum import Enum, auto
 from pathlib import Path
 from threading import Event, Lock
 
-from .drive import _FILES, LIST_GROUP_MAX, DriveClient, _literal, _read_json
+from .drive import LIST_GROUP_MAX, DriveClient, ForeignItemKept, ForeignTarget, _literal
 from .errors import (
     AuthError,
     BadRequest,
@@ -34,6 +34,7 @@ from .errors import (
 from .index import META_CHANGES_RELIABLE, META_CHANGES_TOKEN, META_FORCE_FULL, Index, TrashFile
 from .model import (
     FILE_FIELDS,
+    FOREIGN_ITEM_KEPT,
     OWNER_PROPERTY,
     Op,
     OpKind,
@@ -78,12 +79,14 @@ class _CreateFolderCache:
         drive: DriveClient,
         index: Index,
         root: str,
+        root_uuid: str,
         clock: Callable[[], float],
         refresh_requested: Event,
     ) -> None:
         self._drive = drive
         self._index = index
         self._root = root
+        self._root_uuid = root_uuid
         self._clock = clock
         self._refresh_requested = refresh_requested
         self._verified: dict[str, tuple[str, float]] = {}
@@ -170,11 +173,20 @@ class _CreateFolderCache:
             known = self._index.get_remote(file_id)
             if known is not None:
                 # A mkdir or move by this run is already recorded in the index.
-                return (live.name, live.parents, live.trashed, live.mime_type) != (
+                return (
+                    live.name,
+                    live.parents,
+                    live.trashed,
+                    live.mime_type,
+                    live.owned_by_me,
+                    live.owner_root,
+                ) != (
                     known.name,
                     known.parents,
                     known.trashed,
                     known.mime_type,
+                    known.owned_by_me,
+                    known.owner_root,
                 )
             return (
                 file_id in self._verified
@@ -199,9 +211,13 @@ class _CreateFolderCache:
             if item is None or item.id != folder or item.trashed or not item.is_folder:
                 return None
             if folder == self._root:
+                if item.owner_root not in (None, self._root_uuid):
+                    raise ForeignTarget
                 rel, expires = "", now + _CHANGE_POLL_INTERVAL
                 self._verified[folder] = (rel, expires)
                 break
+            if item.protected_from(self._root_uuid):
+                raise ForeignItemKept
             if len(item.parents) != 1:
                 return None
             trail.append(item)
@@ -300,9 +316,10 @@ class _TrashConfirmed(Exception):
 
 
 class _FolderKept(RemoteChanged):
-    def __init__(self, children: list[Op]) -> None:
+    def __init__(self, children: list[Op], warnings: list[PlanIssue]) -> None:
         super().__init__()
         self.children = children
+        self.warnings = warnings
 
 
 def _same_item(planned: RemoteFile, current: RemoteFile | None) -> bool:
@@ -310,11 +327,18 @@ def _same_item(planned: RemoteFile, current: RemoteFile | None) -> bool:
         return False
     if planned.is_folder and current.is_folder:
         # Folder timestamps can change as a side effect of edits to their children.
-        return (planned.id, planned.name, planned.parents, planned.properties) == (
+        return (
+            planned.id,
+            planned.name,
+            planned.parents,
+            planned.properties,
+            planned.owned_by_me,
+        ) == (
             current.id,
             current.name,
             current.parents,
             current.properties,
+            current.owned_by_me,
         )
     return current == planned
 
@@ -331,14 +355,9 @@ def _inherited_trash_children(
         "spaces": "drive",
         "pageSize": 1000,
     }
-    while True:
-        data = drive._request("GET", _FILES, _read_json, params=params, should_stop=should_stop)
-        for raw in data.get("files", ()):
-            if raw.get("trashed") and not raw.get("explicitlyTrashed"):
-                yield RemoteFile.from_api(raw)
-        if not (token := data.get("nextPageToken")):
-            return
-        params["pageToken"] = token
+    for raw in drive._file_pages(params, should_stop=should_stop):
+        if raw.get("trashed") and not raw.get("explicitlyTrashed"):
+            yield RemoteFile.from_api(raw)
 
 
 def _audit_folder_trash(
@@ -374,6 +393,8 @@ def _first_drift(before: RemoteTree, after: RemoteTree) -> str | None:
 
 
 def _stop_reason(error: NimboError) -> str | None:
+    if isinstance(error, ForeignTarget):
+        return error.code
     if isinstance(error, StorageQuotaExceeded):
         return "storage_quota_exceeded"
     if isinstance(error, UploadLimitExceeded):
@@ -429,6 +450,7 @@ class Executor:
         self._source_root = source_root
         self._real_source_root = source_root.resolve()
         self._properties = {OWNER_PROPERTY: root_uuid}
+        self._root_uuid = root_uuid
         self._tracker = tracker
         self._stop = stop
         self._parallel = parallel
@@ -474,7 +496,7 @@ class Executor:
         )
         if root is not None and self._refresh_remote is not None:
             run.create_folder_cache = _CreateFolderCache(
-                self._drive, self._index, root, self._clock, run.refresh_requested
+                self._drive, self._index, root, self._root_uuid, self._clock, run.refresh_requested
             )
         for phase, pending in phases.items():
             if not run.can_start() or not self._refresh(run):
@@ -553,6 +575,10 @@ class Executor:
             run.create_folder_cache.checkpoint()
         if root is not None:
             run.refreshed = self._index.load_tree(root)
+            target = run.refreshed.get(root)
+            if target is not None and target.owner_root not in (None, self._root_uuid):
+                run.request_stop("foreign-owner")
+                return False
             run.names_by_parent.clear()
             if (drift := _first_drift(before, run.refreshed)) is not None:
                 if run.drift_rel is None:
@@ -620,6 +646,7 @@ class Executor:
             except _FolderKept as exc:
                 self._failure(run, work, exc)
                 run.report.warnings.append(PlanIssue("folder-kept-protected", op.rel))
+                run.report.warnings.extend(exc.warnings)
                 self._index.save_ops(run.id, exc.children)
                 run.trash_followups.extend(_Work(child) for child in exc.children)
                 return False
@@ -686,6 +713,9 @@ class Executor:
 
     def _check_index(self, run: _Run, op: Op, file_id: str) -> None:
         root = self._root_id
+        current = self._index.get_remote(file_id)
+        if current is not None and current.protected_from(self._root_uuid):
+            raise ForeignItemKept(op.src_rel or op.rel)
         if root is None:
             return
         if op.kind not in _CREATE:
@@ -694,7 +724,7 @@ class Executor:
                 not self._index.in_subtree(file_id, root)
                 or file_id == root
                 or planned is None
-                or not _same_item(planned, self._index.get_remote(file_id))
+                or not _same_item(planned, current)
             ):
                 raise RemoteChanged
             source = op.src_rel if op.kind is OpKind.MOVE else op.rel
@@ -725,6 +755,8 @@ class Executor:
                         and parent in current.parents
                         and _rel_component(current.name) == op.name
                     ):
+                        if current.protected_from(self._root_uuid):
+                            raise ForeignItemKept
                         raise RemoteChanged
 
     def _check_destination(
@@ -736,20 +768,27 @@ class Executor:
             return
         in_scope = cache.check(parent, op.parent_rel) if cache is not None else None
         if in_scope is None:
-            in_scope = self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel)
+            in_scope = self._drive.live_folder_in_subtree(
+                parent, root, rel=op.parent_rel, root_uuid=self._root_uuid
+            )
         if not in_scope:
             raise RemoteChanged
-        if op.name is not None and any(
-            item.id != file_id for item in self._drive.list_children([parent], name=op.name)
-        ):
-            raise RemoteChanged
+        if op.name is not None:
+            for item in self._drive.list_children([parent], name=op.name):
+                if item.protected_from(self._root_uuid):
+                    raise ForeignItemKept
+                if item.id != file_id:
+                    raise RemoteChanged
 
     def _check_live_parent(self, item: RemoteFile, rel: str | None) -> None:
         root = self._root_id
         if root is not None and (
             len(item.parents) != 1
             or not self._drive.live_folder_in_subtree(
-                item.parents[0], root, rel=rel.rpartition("/")[0] if rel is not None else None
+                item.parents[0],
+                root,
+                rel=rel.rpartition("/")[0] if rel is not None else None,
+                root_uuid=self._root_uuid,
             )
         ):
             raise RemoteChanged
@@ -770,18 +809,25 @@ class Executor:
 
         # Walk only confirmed planned folders. A foreign folder and its contents
         # are protected even when some planned file IDs have moved into it.
-        folders = [folder.id]
+        folders = [(folder.id, op.rel)]
         covered: dict[str, RemoteFile] = {}
         blocked: set[str] = set()
-        for parent in folders:
+        warnings = []
+        for parent, rel in folders:
             for live in self._drive.list_children([parent]):
                 match = expected.get(live.id)
+                if live.protected_from(self._root_uuid):
+                    warnings.append(
+                        PlanIssue(FOREIGN_ITEM_KEPT, rel_join(rel, _rel_component(live.name)))
+                    )
+                    blocked.add(parent)
+                    continue
                 if match is None or live.parents != (parent,) or not _same_item(match[0], live):
                     blocked.add(parent)
                     continue
                 covered[live.id] = live
                 if live.is_folder:
-                    folders.append(live.id)
+                    folders.append((live.id, match[1]))
         if not blocked:
             self._index.record_trash_files(
                 op,
@@ -793,7 +839,7 @@ class Executor:
                 guarded_ids=covered.keys(),
             )
             return
-        for child_id in reversed(folders[1:]):
+        for child_id, _ in reversed(folders[1:]):
             if child_id in blocked:
                 blocked.add(covered[child_id].parents[0])
 
@@ -811,8 +857,21 @@ class Executor:
                 )
                 for item in covered.values()
                 if item.id not in blocked and item.parents[0] in blocked
-            ]
+            ],
+            warnings,
         )
+
+    def _check_folder_move(self, folder: RemoteFile, source: str) -> None:
+        pending = [(folder.id, source)]
+        seen = {folder.id}
+        for parent, rel in pending:
+            for child in self._drive.list_children([parent]):
+                child_rel = rel_join(rel, _rel_component(child.name))
+                if child.protected_from(self._root_uuid):
+                    raise ForeignItemKept(child_rel)
+                if child.is_folder and child.id not in seen:
+                    seen.add(child.id)
+                    pending.append((child.id, child_rel))
 
     def _trash(self, run: _Run, work: _Work, file_id: str) -> RemoteFile:
         op = work.op
@@ -826,6 +885,8 @@ class Executor:
             live = self._drive.get(file_id)
             if live is not None and live.id == file_id and live.trashed and sent:
                 raise _TrashConfirmed(live)
+            if live is not None and live.protected_from(self._root_uuid):
+                raise ForeignItemKept
             if live is None and sent:
                 work.trash_uncertain = True
             if live is None or not _same_item(planned, live):
@@ -886,13 +947,17 @@ class Executor:
 
         def check_metadata() -> None:
             self._check_destination(op, file_id)
+            live = self._drive.get(file_id)
+            source = op.src_rel if op.kind is OpKind.MOVE else op.rel
+            if live is not None and live.protected_from(self._root_uuid):
+                raise ForeignItemKept(source or op.rel)
             if self._root_id is None:
+                if op.kind is OpKind.MOVE and live is not None and live.is_folder:
+                    self._check_folder_move(live, source or op.rel)
                 return
             previous = run.planned.get(file_id)
-            live = self._drive.get(file_id)
             if previous is None or live is None:
                 raise RemoteChanged
-            source = op.src_rel if op.kind is OpKind.MOVE else op.rel
             if not _same_item(previous, live):
                 # An earlier retryable request may already have changed the item.
                 if not (
@@ -908,6 +973,8 @@ class Executor:
                     raise RemoteChanged
                 source = op.rel
             self._check_live_parent(live, source)
+            if op.kind is OpKind.MOVE and live.is_folder:
+                self._check_folder_move(live, source or op.rel)
 
         if op.kind is OpKind.MKDIR:
             assert op.parent_id is not None and op.name is not None
@@ -976,13 +1043,18 @@ class Executor:
             expected_remote=planned if update else None,
         )
         try:
-            outcome = self._uploader.upload(
-                request,
-                on_bytes=on_bytes,
-                should_stop=self._stop.is_set,
-                root_id=self._root_id,
-                check_create_parent=cache.check if cache is not None and not update else None,
-            )
+            if self._root_id is None and update:
+                live = self._drive.get(file_id)
+                if live is not None and live.protected_from(self._root_uuid):
+                    raise ForeignItemKept
+            with self._drive.guard_upload_scope(self._root_id or "", self._root_uuid):
+                outcome = self._uploader.upload(
+                    request,
+                    on_bytes=on_bytes,
+                    should_stop=self._stop.is_set,
+                    root_id=self._root_id,
+                    check_create_parent=cache.check if cache is not None and not update else None,
+                )
         except FileNotFoundError as exc:
             raise _LocalReadError(code="local_vanished") from exc
         except OSError as exc:
@@ -1018,6 +1090,8 @@ class Executor:
         if (reason := _stop_reason(error)) is not None:
             run.request_stop(reason)
         with run.lock:
+            if code == FOREIGN_ITEM_KEPT:
+                run.report.warnings.append(PlanIssue(FOREIGN_ITEM_KEPT, error.detail or op.rel))
             # A previous HTTP attempt can have committed even if its reply was lost.
             # Do not rely on the feed to find an unconfirmed write before the next plan.
             self._index.set_meta(META_FORCE_FULL, "1")

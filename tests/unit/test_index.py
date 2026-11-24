@@ -20,7 +20,14 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from nimbo.core.errors import NimboError
-from nimbo.core.index import _MIGRATIONS, META_CHANGES_TOKEN, SCHEMA_VERSION, Index, TrashFile
+from nimbo.core.index import (
+    _MIGRATIONS,
+    META_CHANGES_TOKEN,
+    META_FORCE_FULL,
+    SCHEMA_VERSION,
+    Index,
+    TrashFile,
+)
 from nimbo.core.model import (
     FOLDER_MIME,
     FolderStat,
@@ -151,10 +158,14 @@ def test_migrate_v2_preserves_trash_snapshots(
             index.record_trash_files(
                 op, [TrashFile("file", "Photos/old/report", 10, "recorded-md5")]
             )
-            index.complete_op(op, trash_log_run=run_id, trashed_is_folder=True)
+            index._connection.execute(
+                "INSERT INTO trash_log (run_id, file_id, rel, is_folder, op_id) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (run_id, op.file_id, op.rel, op.db_id),
+            )
 
     with closing(Index(db_path)) as index:
-        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert index.guarded_trash_ids(op) is None
         snapshot = index.trash_files(run_id)["file"]
         assert (snapshot.rel, snapshot.size, snapshot.md5) == (
@@ -162,6 +173,28 @@ def test_migrate_v2_preserves_trash_snapshots(
             10,
             "recorded-md5",
         )
+
+
+def test_migrate_v3_refreshes_unknown_ownership(db_path: Path) -> None:
+    with closing(sqlite3.connect(db_path)) as connection, connection:
+        for version in (1, 2, 3):
+            for statement in _MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 3")
+        connection.execute("INSERT INTO meta VALUES (?, 'cursor')", (META_CHANGES_TOKEN,))
+        connection.execute("INSERT INTO remote (id, name, mime_type) VALUES ('id', 'old', 'text')")
+
+    with closing(Index.open_readonly(db_path)) as index:
+        assert index.get_remote("id") == RemoteFile("id", "old", "text")
+
+    with closing(Index(db_path)) as index:
+        assert index.get_remote("id") == RemoteFile("id", "old", "text")
+        assert index.get_meta(META_FORCE_FULL) == "1"
+        assert index.get_meta(META_CHANGES_TOKEN) == "cursor"
+        for owned in (False, True, None):
+            item = RemoteFile("id", "old", "text", owned_by_me=owned)
+            index.upsert_remote([item])
+            assert index.get_remote("id") == item
 
 
 def test_meta_set_get_delete(db: Index) -> None:

@@ -21,6 +21,7 @@ FILE: Schema = dict.fromkeys(
         "modifiedTime",
         "trashed",
         "explicitlyTrashed",
+        "ownedByMe",
     )
 ) | {"properties": {}}
 FILES: Schema = {"kind": None, "nextPageToken": None, "files": FILE}

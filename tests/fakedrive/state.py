@@ -60,6 +60,7 @@ class FakeFile:
     device: bool = False
     content: bytes = b""
     md5: str | None = None
+    owned_by_me: bool | None = True
 
     @property
     def is_folder(self) -> bool:
@@ -96,6 +97,8 @@ class FakeFile:
         }
         if self.is_binary:
             data.update(size=str(len(self.content)), md5Checksum=self.md5)
+        if self.owned_by_me is not None:
+            data["ownedByMe"] = self.owned_by_me
         return data
 
     def _with_content(self, content: bytes) -> FakeFile:
@@ -182,6 +185,7 @@ class DriveState:
         modified_ms: int | None = None,
         properties: Mapping[str, str] | None = None,
         device: bool = False,
+        owned_by_me: bool | None = True,
     ) -> str:
         """Insert a fixture file and report its ID without charging API limits."""
         parent_id = self._parent(parent).id
@@ -193,6 +197,7 @@ class DriveState:
             self.millis() if modified_ms is None else modified_ms,
             dict(properties or {}),
             device=device,
+            owned_by_me=owned_by_me,
         )
         if item.is_binary:
             item = item._with_content(content)

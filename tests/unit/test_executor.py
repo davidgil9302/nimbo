@@ -28,6 +28,7 @@ from nimbo.core.model import (
     Op,
     OpKind,
     OpState,
+    PlanIssue,
     RemoteFile,
     RunResult,
     drive_ms,
@@ -1375,6 +1376,88 @@ def test_fresh_resumable_create_polls_before_sending_data(remote: _Harness) -> N
     assert now == 1.1 and report.failed == [("nested/file", "remote_changed")]
     assert not remote.fake.find(folder, "file")
     assert all(call.method != "PUT" for call in remote.fake.calls)
+
+
+@pytest.mark.parametrize(
+    "kind", [OpKind.UPDATE, OpKind.ADOPT, OpKind.TOUCH, OpKind.MOVE, OpKind.TRASH]
+)
+def test_live_ownership_blocks_existing_item_write(remote: _Harness, kind: OpKind) -> None:
+    root = remote.fake.add_folder("Target")
+    item = remote.fake.add_file("file", root, b"initial bytes")
+    op = remote.upload("file", b"new bytes", update=item)
+    op.kind = kind
+    if kind is OpKind.MOVE:
+        op.src_rel, op.src_parent_id = "file", root
+        op.rel, op.parent_id, op.name = "renamed", root, "renamed"
+    else:
+        op.parent_id, op.name = None, None
+    run, tracker = remote.persist([op])
+
+    def return_unowned(req: httpx.Request, response: httpx.Response) -> httpx.Response:
+        if req.method == "GET" and req.url.path.endswith(f"/{item}"):
+            return httpx.Response(200, json={**response.json(), "ownedByMe": False})
+        return response
+
+    remote.responses.append(return_unowned)
+    start = len(remote.fake.calls)
+    result = remote.executor(tracker, root_id=root).execute(run, [op])
+
+    assert not result.done
+    assert result.warnings == [PlanIssue("foreign-item-kept", "file")]
+    assert all(call.method == "GET" for call in remote.fake.calls[start:])
+
+
+def test_resumable_update_rechecks_ownership_before_commit(remote: _Harness) -> None:
+    root = remote.fake.add_folder("Target")
+    item = remote.fake.add_file("file", root, b"initial bytes")
+    op = remote.upload("file", b"x" * (_CHUNK + 1), update=item)
+    run, tracker = remote.persist([op])
+    start = len(remote.fake.calls)
+
+    def return_unowned_after_session(
+        req: httpx.Request, response: httpx.Response
+    ) -> httpx.Response:
+        if (
+            req.method == "GET"
+            and req.url.path.endswith(f"/{item}")
+            and any(
+                call.query.get("uploadType") == "resumable" for call in remote.fake.calls[start:]
+            )
+        ):
+            return httpx.Response(200, json={**response.json(), "ownedByMe": False})
+        return response
+
+    remote.responses.append(return_unowned_after_session)
+    result = remote.executor(tracker, root_id=root).execute(run, [op])
+
+    assert not result.done
+    assert result.warnings == [PlanIssue("foreign-item-kept", "file")]
+    assert remote.fake.file(item).content == b"initial bytes"
+    assert sum(call.method == "PUT" for call in remote.fake.calls[start:]) == 1
+
+
+def test_folder_move_keeps_foreign_descendant_in_place(remote: _Harness) -> None:
+    root = remote.fake.add_folder("Target")
+    folder = remote.fake.add_folder("folder", root)
+    move = Op(
+        OpKind.MOVE,
+        "renamed",
+        "renamed",
+        file_id=folder,
+        src_rel="folder",
+        src_parent_id=root,
+        parent_id=root,
+        name="renamed",
+    )
+    run, tracker = remote.persist([move])
+    child = remote.fake.add_file("editor", folder, b"new child", owned_by_me=False)
+
+    result = remote.executor(tracker, root_id=root).execute(run, [move])
+
+    assert not result.done
+    assert result.warnings == [PlanIssue("foreign-item-kept", "folder/editor")]
+    assert remote.fake.file(folder).name == "folder"
+    assert remote.fake.file(child).parent_id == folder
 
 
 def test_busy_content_phase_refreshes_after_operation_budget(remote: _Harness) -> None:

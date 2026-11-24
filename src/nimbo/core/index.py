@@ -17,7 +17,7 @@ from nimbo.core.errors import NimboError
 from nimbo.core.model import FolderStat, Op, OpKind, OpState, RemoteFile, RunSummary, utc_now_iso
 from nimbo.core.tree import RemoteTree
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 META_ROOT_UUID = "root_uuid"
 META_TARGET_ID = "target_root_id"
 # Metadata key for the Drive changes cursor.
@@ -83,16 +83,20 @@ _MIGRATIONS = {
         """,
     ),
     3: ("ALTER TABLE op ADD COLUMN trash_guard TEXT",),
+    4: (
+        "ALTER TABLE remote ADD COLUMN owned_by_me INTEGER",
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_full_listing', '1')",
+    ),
 }
 
 _UPSERT_REMOTE = """
     INSERT INTO remote (id, parent_id, name, mime_type, size, md5, modified_ms, properties,
-                        trashed, parents)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        trashed, parents, owned_by_me)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id, name=excluded.name,
       mime_type=excluded.mime_type, size=excluded.size, md5=excluded.md5,
       modified_ms=excluded.modified_ms, properties=excluded.properties,
-      trashed=excluded.trashed, parents=excluded.parents
+      trashed=excluded.trashed, parents=excluded.parents, owned_by_me=excluded.owned_by_me
 """
 
 _DELETE_REMOTE_SUBTREE = """
@@ -128,6 +132,10 @@ def _checked(parameters: _Parameters) -> _Parameters:
 
 
 def _remote_row(row: sqlite3.Row) -> RemoteFile:
+    try:
+        owned = row["owned_by_me"]
+    except IndexError:  # Read-only access to a journal that has yet to migrate.
+        owned = None
     return RemoteFile(
         id=row["id"],
         name=row["name"],
@@ -138,6 +146,7 @@ def _remote_row(row: sqlite3.Row) -> RemoteFile:
         modified_ms=row["modified_ms"],
         properties=json.loads(row["properties"]),
         trashed=bool(row["trashed"]),
+        owned_by_me=None if owned is None else bool(owned),
     )
 
 
@@ -326,6 +335,7 @@ class Index:
                     json.dumps(dict(item.properties), ensure_ascii=False),
                     item.trashed,
                     json.dumps(item.parents, ensure_ascii=False),
+                    item.owned_by_me,
                 )
                 for item in files
             ),
@@ -379,6 +389,16 @@ class Index:
         """Return the total number of stored remote rows."""
         with self._transaction():
             return int(self._execute("SELECT count(*) FROM remote").fetchone()[0])
+
+    def last_written_id(self, rel: str, candidates: Collection[str]) -> str | None:
+        """Return the most recently completed write at rel to one of the candidate IDs."""
+        with self._transaction():
+            rows = self._execute(
+                "SELECT file_id FROM op WHERE rel = ? AND state = 'done' AND kind <> 'trash' "
+                "ORDER BY id DESC",
+                (rel,),
+            )
+            return next((row[0] for row in rows if row[0] in candidates), None)
 
     def get_hash(self, rel: str, size: int, mtime_ns: int) -> str | None:
         """Return a cached hash only if its path, size, and mtime all match."""

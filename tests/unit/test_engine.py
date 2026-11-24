@@ -429,11 +429,27 @@ def test_target_missing_fails(mirror: _Harness) -> None:
     assert mirror.fake.write_count() == 0
 
 
-def test_foreign_owner_fails(mirror: _Harness) -> None:
-    mirror.fake.add_folder("Docs", mirror.target, properties={OWNER_PROPERTY: "foreign"})
+def test_foreign_target_owner_fails(mirror: _Harness) -> None:
+    mirror.deps.drive.update_metadata(mirror.target, properties={OWNER_PROPERTY: "foreign"})
+    before = mirror.fake.write_count()
     summary = mirror.run(result=RunResult.FAILED)
     assert summary.reason == "foreign-owner"
-    assert mirror.fake.write_count() == 0
+    assert mirror.fake.write_count() == before
+
+
+def test_duplicate_folder_prefers_journal_after_refresh_cached_both(mirror: _Harness) -> None:
+    mirror.run()
+    docs = mirror.fake.find(mirror.target, "Docs")[0]
+    duplicate = mirror.fake.add_folder(
+        "Docs", mirror.target, modified_ms=docs.modified_ms + 60_000, properties=docs.properties
+    )
+    assert mirror.engine.preview().plan.folder_ids["Docs"] == docs.id
+    assert len(mirror.index.load_tree(mirror.target).by_rel()["Docs"]) == 2
+
+    mirror.run()
+
+    assert not mirror.fake.file(docs.id).trashed
+    assert mirror.fake.file(duplicate).trashed
 
 
 def test_locked_skips(mirror: _Harness) -> None:

@@ -41,6 +41,7 @@ def _remote(
     md5: str | None = "same",
     owner: str | None = OWNER,
     mime: str | None = None,
+    owned_by_me: bool | None = True,
 ) -> RemoteFile:
     return RemoteFile(
         id_,
@@ -51,6 +52,7 @@ def _remote(
         md5 if size >= 0 else None,
         ms,
         {OWNER_PROPERTY: owner} if owner is not None else {},
+        owned_by_me=owned_by_me,
     )
 
 
@@ -67,6 +69,7 @@ def _plan(
     patterns: tuple[str, ...] = (),
     hash_of: Callable[[LocalEntry], str | None] = lambda entry: "same",
     top: bool = True,
+    mapped_id: Callable[[str, set[str]], str | None] = lambda _rel, _ids: None,
 ) -> Plan:
     entries = (LOCAL_TOP, *local)
     files = (TOP, *remote) if top else remote
@@ -76,6 +79,7 @@ def _plan(
         Matcher(patterns),
         hash_of,
         PlannerOptions((FOLDER,), OWNER, deep=deep, protected=protected),
+        mapped_id=mapped_id,
     )
 
 
@@ -522,14 +526,39 @@ def test_duplicate_folder_children_are_paired_under_the_retained_parent():
     assert plan.ops[-1].affected_files == 1
 
 
-def test_foreign_owner_is_error():
+@pytest.mark.parametrize("matching", [False, True])
+def test_duplicate_prefers_checksum_then_previous_mapping(matching: bool):
+    plan = _plan(
+        [_entry("report")],
+        [
+            _remote("previous", "report", ms=9, md5="same" if matching else "old"),
+            _remote("newer", "report", ms=11),
+        ],
+        mapped_id=lambda _rel, _ids: "previous",
+    )
+    assert plan.ops[-1].file_id == ("newer" if matching else "previous")
+
+
+def test_unknown_ownership_keeps_legacy_file_behavior():
+    plan = _plan(
+        [_entry("report", size=5)],
+        [_remote("legacy", "report", owned_by_me=None)],
+    )
+    assert _ops(plan) == [(OpKind.UPDATE, "Projects/report", "legacy")]
+    assert not plan.stats.per_folder_remote_files
+
+
+def test_foreign_owner_is_kept():
     plan = _plan(
         [_entry("new")],
         [_remote("f", "f", owner="foreign", mime="application/vnd.google-apps.shortcut")],
         protected=("Projects/f",),
     )
-    assert plan.is_empty
-    assert [(issue.code, issue.rel) for issue in plan.errors] == [("foreign-owner", "Projects/f")]
+    assert _ops(plan) == [(OpKind.UPLOAD, "Projects/new", None)]
+    assert not plan.errors
+    assert [(issue.code, issue.rel) for issue in plan.warnings] == [
+        ("foreign-item-kept", "Projects/f")
+    ]
 
 
 def test_invalid_remote_names_trashed():
