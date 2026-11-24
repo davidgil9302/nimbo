@@ -62,6 +62,35 @@ def _assert_mirror(case: DriveCase, *, ignored: Collection[str] = ()) -> dict[st
     return items
 
 
+def _wait_for_drive_changes(case: DriveCase, start_cursor: str, *items: RemoteFile) -> None:
+    """Re-read from before the writes until the feed shows each expected file state."""
+    expected = {item.id: item for item in items}
+    pending = expected.copy()
+    timeout = 60
+    deadline = monotonic() + timeout
+    while pending and monotonic() < deadline:
+        pending = expected.copy()
+        cursor: str | None = start_cursor
+        seen: set[str] = set()
+        while cursor is not None and cursor not in seen and monotonic() < deadline:
+            seen.add(cursor)
+            page = case.drive.changes(cursor)
+            for change in page.changes:
+                item = change.file
+                if not change.removed and item is not None and item == pending.get(change.file_id):
+                    del pending[change.file_id]
+            if not pending:
+                return
+            cursor = page.next_page_token
+        sleep(max(0, min(1, deadline - monotonic())))
+    if pending:
+        missing = ", ".join(sorted(pending))
+        pytest.fail(
+            f"The Drive changes feed did not report matching metadata for file IDs {missing} "
+            f"within {timeout} seconds"
+        )
+
+
 def test_varied_tree_uses_resumable_upload(drive_case: DriveCase) -> None:
     """Mirror nested names, Unicode, an empty file and a 30 MiB binary."""
     build_tree(
@@ -171,6 +200,7 @@ def test_external_content_edit_is_overwritten_on_next_run(drive_case: DriveCase)
     """Repair a same-size Drive edit even when it preserves the file mtime."""
     drive_case.run()
     original = _assert_mirror(drive_case)[ANCHOR]
+    start_cursor = drive_case.drive.start_page_token()
     edited = drive_case.write_binary(original, data=b"edit", properties={"e2e-editor": "external"})
     assert edited.properties.get("e2e-editor") == "external"
     assert (edited.size, edited.modified_ms, edited.md5) == (
@@ -178,6 +208,7 @@ def test_external_content_edit_is_overwritten_on_next_run(drive_case: DriveCase)
         original.modified_ms,
         _md5(b"edit"),
     )
+    _wait_for_drive_changes(drive_case, start_cursor, edited)
 
     summary = drive_case.run()
 
@@ -190,6 +221,7 @@ def test_duplicate_names_keep_the_matching_file(drive_case: DriveCase) -> None:
     drive_case.run()
     original = _assert_mirror(drive_case)[ANCHOR]
     assert original.owner_root is not None
+    start_cursor = drive_case.drive.start_page_token()
     duplicate = drive_case.write_binary(
         original,
         data=b"managed duplicate",
@@ -201,6 +233,7 @@ def test_duplicate_names_keep_the_matching_file(drive_case: DriveCase) -> None:
     )
     assert len({original.id, duplicate.id, foreign.id}) == 3
     assert duplicate.name == foreign.name == original.name
+    _wait_for_drive_changes(drive_case, start_cursor, duplicate, foreign)
 
     summary = drive_case.run()
 
@@ -227,10 +260,12 @@ def test_google_doc_protects_locally_deleted_folder(drive_case: DriveCase) -> No
     build_tree(root, {rel: b"discard"})
     drive_case.run()
     before = _assert_mirror(drive_case)
+    start_cursor = drive_case.drive.start_page_token()
     doc = drive_case.create_doc(before[folder].id)
     assert doc.mime_type == DOC_MIME and doc.parents == (before[folder].id,)
     (root / rel).unlink()
     (root / folder).rmdir()
+    _wait_for_drive_changes(drive_case, start_cursor, doc)
 
     summary = drive_case.run()
 
@@ -249,23 +284,7 @@ def test_changes_feed_reports_our_writes_and_satisfies_probe(drive_case: DriveCa
     start_cursor = drive_case.drive.start_page_token()
     drive_case.run()
     item = _assert_mirror(drive_case)[ANCHOR]
-
-    deadline = monotonic() + 60
-    while monotonic() < deadline:
-        cursor: str | None = start_cursor
-        seen: set[str] = set()
-        while cursor is not None and cursor not in seen and monotonic() < deadline:
-            seen.add(cursor)
-            page = drive_case.drive.changes(cursor)
-            if any(change.file_id == item.id and not change.removed for change in page.changes):
-                break
-            cursor = page.next_page_token
-        else:
-            sleep(max(0, min(1, deadline - monotonic())))
-            continue
-        break
-    else:
-        pytest.fail("The Drive changes feed did not report the new test file within 60 seconds")
+    _wait_for_drive_changes(drive_case, start_cursor, item)
 
     drive_case.run()
     with closing(Index.open_readonly(drive_case.paths.db_file)) as index:
