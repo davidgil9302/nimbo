@@ -376,19 +376,19 @@ def test_force_full_meta(harness: _Harness) -> None:
     assert indexer.refresh().mode == "changes"
 
 
+@pytest.mark.parametrize("age", [timedelta(minutes=10), timedelta(minutes=11)])
 def test_probe_reliable_and_unreliable_paths(
-    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, age: timedelta
 ) -> None:
     """Test both probe outcomes even when local writes already indexed the probe rows."""
     indexer, fake, db = harness.indexer(), harness.fake, harness.db
     indexer.full_listing()
     actual = fake.add_file("observed", harness.root, b"")
     indexer.record_probe(["other", actual, *(f"unused-{n}" for n in range(25))])
-    assert json.loads(db.get_meta(META_CHANGES_PROBE) or "null") == [
-        "other",
-        actual,
-        *(f"unused-{n}" for n in range(18)),
-    ]
+    assert json.loads(db.get_meta(META_CHANGES_PROBE) or "null") == {
+        "ids": ["other", actual, *(f"unused-{n}" for n in range(18))],
+        "recorded_at": harness.now.isoformat(),
+    }
     assert indexer.refresh() == RefreshResult("changes", 2, 1)
     assert db.get_meta(META_CHANGES_RELIABLE) == "1"
     assert db.get_meta(META_CHANGES_PROBE) is None
@@ -407,12 +407,93 @@ def test_probe_reliable_and_unreliable_paths(
         return ChangesPage((), page.next_page_token, page.new_start_page_token)
 
     monkeypatch.setattr(harness.drive, "changes", omit_events)
+    harness.now += age
     assert indexer.refresh() == RefreshResult("full", 4, 0)
     assert db.get_meta(META_CHANGES_RELIABLE) == "0"
     assert db.get_meta(META_CHANGES_PROBE) is None
     fake.calls.clear()
     assert indexer.refresh().mode == "full"
     assert all(call.path != _CHANGES for call in fake.calls)
+
+
+@pytest.mark.parametrize("reliability", [None, "1"])
+def test_young_probe_survives_full_listing_until_reported(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, reliability: str | None
+) -> None:
+    """Use the old feed window to retry the probe after a full listing during the grace period."""
+    indexer, fake, db = harness.indexer(), harness.fake, harness.db
+    indexer.full_listing()
+    token = db.get_meta(META_CHANGES_TOKEN)
+    db.set_meta(META_CHANGES_RELIABLE, reliability)
+    harness.now += timedelta(hours=1)
+    file_id = fake.add_file("delayed", harness.root, b"")
+    indexer.record_probe([file_id])
+    probe = db.get_meta(META_CHANGES_PROBE)
+    assert probe is not None
+    harness.now += timedelta(minutes=10) - timedelta(microseconds=1)
+    changes = harness.drive.changes
+
+    def delay_event(token: str) -> ChangesPage:
+        page = changes(token)
+        return ChangesPage((), page.next_page_token, page.new_start_page_token)
+
+    # The next cursor from Drive already excludes the delayed event.
+    with monkeypatch.context() as patch:
+        patch.setattr(harness.drive, "changes", delay_event)
+        assert indexer.refresh() == RefreshResult("full", 2, 0)
+    assert harness.paths() == {"delayed": file_id}
+    assert db.get_meta(META_CHANGES_TOKEN) == token
+    assert db.get_meta(META_CHANGES_PROBE) == probe
+    assert db.get_meta(META_CHANGES_RELIABLE) == reliability
+
+    indexer.record_probe([])
+    assert db.get_meta(META_CHANGES_PROBE) == probe
+    assert harness.indexer().refresh() == RefreshResult("changes", 2, 1)
+    assert db.get_meta(META_CHANGES_RELIABLE) == "1"
+    assert db.get_meta(META_CHANGES_PROBE) is None
+
+
+@pytest.mark.parametrize(
+    ("reported", "reliability"), [(False, "1"), (True, None)], ids=["missing", "reported"]
+)
+def test_probe_recorded_in_future_uses_new_full_checkpoint(
+    harness: _Harness, reported: bool, reliability: str | None
+) -> None:
+    """Discard a probe after the clock moves back past its recording time."""
+    indexer, fake, db = harness.indexer(), harness.fake, harness.db
+    indexer.full_listing()
+    token = db.get_meta(META_CHANGES_TOKEN)
+    db.set_meta(META_CHANGES_RELIABLE, reliability)
+    harness.now += timedelta(minutes=2)
+    file_id = fake.add_file("created", harness.root, b"")
+    indexer.record_probe([file_id if reported else "omitted"])
+    harness.now -= timedelta(minutes=1)
+    new_token = harness.drive.start_page_token()
+    assert new_token != token
+    fake.calls.clear()
+
+    assert indexer.refresh() == RefreshResult("full", 2, 0)
+    assert [call.path for call in fake.calls[:2]] == [_CHANGES, _START]
+    assert db.get_meta(META_CHANGES_TOKEN) == new_token
+    assert db.get_meta(META_CHANGES_PROBE) is None
+    assert db.get_meta(META_CHANGES_RELIABLE) == reliability
+    assert harness.paths() == {"created": file_id}
+    assert indexer.refresh() == RefreshResult("changes", 2, 0)
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_legacy_probe_has_no_grace_period(harness: _Harness, reported: bool) -> None:
+    """Read a legacy list and immediately record whether the feed contains one of its IDs."""
+    indexer, fake, db = harness.indexer(), harness.fake, harness.db
+    indexer.full_listing()
+    file_id = fake.add_file("created", harness.root, b"")
+    db.set_meta(META_CHANGES_PROBE, json.dumps([file_id if reported else "omitted"]))
+
+    assert indexer.refresh() == (
+        RefreshResult("changes", 2, 1) if reported else RefreshResult("full", 2, 0)
+    )
+    assert db.get_meta(META_CHANGES_RELIABLE) == ("1" if reported else "0")
+    assert db.get_meta(META_CHANGES_PROBE) is None
 
 
 def test_full_checkpoint_consumes_superseded_probe(harness: _Harness) -> None:
@@ -441,12 +522,13 @@ def test_stop_raises_stopped(harness: _Harness, monkeypatch: pytest.MonkeyPatch,
 
     def progress(items: int) -> None:
         nonlocal stop
-        if mode != "probe" or any(call.path == _START for call in fake.calls):
+        if mode != "probe" or any(call.path == f"{_FILES}/{harness.root}" for call in fake.calls):
             stop = True
 
     fake.calls.clear()
     if mode == "probe":
         indexer.record_probe(["omitted"])
+    probe = db.get_meta(META_CHANGES_PROBE)
     if mode == "full":
         db.set_meta(META_FORCE_FULL, "1")
     with pytest.raises(Stopped):
@@ -454,7 +536,7 @@ def test_stop_raises_stopped(harness: _Harness, monkeypatch: pytest.MonkeyPatch,
     assert db.get_meta(META_CHANGES_TOKEN) == previous
     assert db.get_meta(META_LAST_FULL) == _NOW.isoformat()
     assert db.get_meta(META_FORCE_FULL) == ("1" if mode == "full" else None)
-    assert db.get_meta(META_CHANGES_PROBE) == ('["omitted"]' if mode == "probe" else None)
+    assert db.get_meta(META_CHANGES_PROBE) == probe
     assert db.get_meta(META_CHANGES_RELIABLE) is None
     assert harness.paths() == {}
     assert db.remote_count() == 1

@@ -24,6 +24,7 @@ from nimbo.core.model import RemoteFile
 from nimbo.core.tree import RemoteTree
 
 _PROBE_LIMIT = 20
+_PROBE_GRACE = timedelta(minutes=10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +135,11 @@ class RemoteIndexer:
         storage errors if the metadata cannot be written.
         """
         if created_ids:
-            self._index.set_meta(META_CHANGES_PROBE, json.dumps(list(created_ids[:_PROBE_LIMIT])))
+            probe = {
+                "ids": list(created_ids[:_PROBE_LIMIT]),
+                "recorded_at": self._clock().isoformat(),
+            }
+            self._index.set_meta(META_CHANGES_PROBE, json.dumps(probe))
 
     def _check_stop(self) -> None:
         if self._should_stop is not None and self._should_stop():
@@ -162,23 +167,26 @@ class RemoteIndexer:
         return reachable
 
     def _full_listing(
-        self, progress: _Progress, *, reliability: Literal["0", "1"] | None = None
+        self,
+        progress: _Progress,
+        *,
+        reliability: Literal["0", "1"] | None = None,
+        keep_probe: bool = False,
     ) -> RefreshResult:
         self._check_stop()
-        token = self._drive.start_page_token()
+        meta: dict[str, str | None] = {}
+        if not keep_probe:
+            meta[META_CHANGES_TOKEN] = self._drive.start_page_token()
+            # The new cursor deliberately skips the feed window covered by this probe.
+            meta[META_CHANGES_PROBE] = None
         self._check_stop()
         root = self._require_target(self._drive.get(self._root_id))
         progress.advance(1)
         files = self._list_subtrees([root.id], progress)
         files[root.id] = root
         reachable = self._reachable(files)
-        meta: dict[str, str | None] = {
-            META_CHANGES_TOKEN: token,
-            META_LAST_FULL: self._clock().isoformat(),
-            META_FORCE_FULL: None,
-            # The new cursor deliberately skips the feed window covered by this probe.
-            META_CHANGES_PROBE: None,
-        }
+        meta[META_LAST_FULL] = self._clock().isoformat()
+        meta[META_FORCE_FULL] = None
         if reliability is not None:
             meta[META_CHANGES_RELIABLE] = reliability
         self._check_stop()
@@ -249,17 +257,26 @@ class RemoteIndexer:
                 raise DriveError("Drive changes repeated a page token")
             seen_tokens.add(token)
 
-    def _probe_ids(self) -> set[str] | None:
+    def _load_probe(self) -> tuple[set[str], timedelta | None] | None:
         raw = self._index.get_meta(META_CHANGES_PROBE)
         if raw is None:
-            return set()
+            return set(), None
+        age = None
         try:
             ids: object = json.loads(raw)
-        except ValueError:
+            if isinstance(ids, dict):
+                timestamp = ids.get("recorded_at")
+                if not isinstance(timestamp, str):
+                    return None
+                age = self._clock() - datetime.fromisoformat(timestamp)
+                if age < timedelta(0):
+                    return None
+                ids = ids.get("ids")
+        except (TypeError, ValueError):
             return None
         if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
             return None
-        return set(ids)
+        return set(ids), age
 
     def _apply_changes(self, token: str, progress: _Progress) -> RefreshResult:
         self._check_stop()
@@ -277,11 +294,15 @@ class RemoteIndexer:
 
         self._require_target(batch.files.get(root.id, root))
         meta: dict[str, str | None] = {META_CHANGES_TOKEN: batch.token}
-        probes = self._probe_ids()
-        if probes is None:
+        probe = self._load_probe()
+        if probe is None:
             return self._full_listing(progress)
+        probes, age = probe
         if probes:
             if probes.isdisjoint(batch.files):
+                if age is not None and age < _PROBE_GRACE:
+                    # Reuse the same feed window so a delayed event can still satisfy the probe.
+                    return self._full_listing(progress, keep_probe=True)
                 return self._full_listing(progress, reliability="0")
             meta.update({META_CHANGES_RELIABLE: "1", META_CHANGES_PROBE: None})
 

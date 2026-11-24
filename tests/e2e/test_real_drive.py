@@ -8,6 +8,7 @@ from collections.abc import Collection
 from contextlib import closing
 from datetime import UTC, datetime
 from threading import Event
+from time import monotonic, sleep
 from unicodedata import normalize
 
 import pytest
@@ -245,19 +246,26 @@ def test_google_doc_protects_locally_deleted_folder(drive_case: DriveCase) -> No
 
 def test_changes_feed_reports_our_writes_and_satisfies_probe(drive_case: DriveCase) -> None:
     """Read the new binary from the real changes feed and verify engine probe state."""
-    cursor: str | None = drive_case.drive.start_page_token()
+    start_cursor = drive_case.drive.start_page_token()
     drive_case.run()
     item = _assert_mirror(drive_case)[ANCHOR]
 
-    seen = set()
-    while cursor is not None and cursor not in seen:
-        seen.add(cursor)
-        page = drive_case.drive.changes(cursor)
-        if any(change.file_id == item.id and not change.removed for change in page.changes):
-            break
-        cursor = page.next_page_token
+    deadline = monotonic() + 60
+    while monotonic() < deadline:
+        cursor: str | None = start_cursor
+        seen: set[str] = set()
+        while cursor is not None and cursor not in seen and monotonic() < deadline:
+            seen.add(cursor)
+            page = drive_case.drive.changes(cursor)
+            if any(change.file_id == item.id and not change.removed for change in page.changes):
+                break
+            cursor = page.next_page_token
+        else:
+            sleep(max(0, min(1, deadline - monotonic())))
+            continue
+        break
     else:
-        pytest.fail("The Drive changes feed did not report the new test file")
+        pytest.fail("The Drive changes feed did not report the new test file within 60 seconds")
 
     drive_case.run()
     with closing(Index.open_readonly(drive_case.paths.db_file)) as index:
