@@ -1160,7 +1160,9 @@ def test_unreadable_scan_is_partial_and_auditable(
     scandir = os.scandir
 
     def blocked_scandir(path):
-        if path == mirror.root / blocked:
+        # The scanner lists directories by descriptor; resolve it to compare paths.
+        listed = Path(os.readlink(f"/proc/self/fd/{path}")) if isinstance(path, int) else path
+        if listed == (mirror.root / blocked).resolve():
             raise PermissionError(13, "Permission denied")
         return scandir(path)
 
