@@ -25,6 +25,9 @@ folders you choose to a folder in your own Google Drive.</p>
 <li>With your authorization (scope <code>https://www.googleapis.com/auth/drive</code>), nimbo lists,
 uploads, updates, moves and moves to the trash files and folders <strong>only inside the Drive folder
 you select</strong> as the backup destination, and reads your storage quota.</li>
+<li>To notice changes quickly, nimbo also reads Google Drive's list of recent changes. That list
+covers your whole Drive, so nimbo keeps only the entries inside the backup folder and discards the
+rest at once, without storing or sending them anywhere.</li>
 <li>It uses that access solely to keep that folder an exact mirror of your local folders and to
 restore files you ask it to restore.</li>
 </ul>
@@ -54,6 +57,9 @@ respalda las carpetas que elijas en una carpeta de tu propio Google Drive.</p>
 actualiza, mueve y manda a la papelera archivos y carpetas <strong>solo dentro de la carpeta de Drive
 que elijas</strong> como destino, y consulta tu espacio disponible. Usa ese acceso únicamente para
 mantener esa carpeta como espejo exacto de tus carpetas locales y para restaurar lo que le pidas.</p>
+<p>Para detectar cambios con rapidez, nimbo también lee la lista de cambios recientes de Google Drive.
+Esa lista abarca todo tu Drive, así que nimbo conserva solo las entradas que están dentro de la
+carpeta de respaldo y descarta el resto al instante, sin guardarlo ni enviarlo a ninguna parte.</p>
 <p>Los datos viajan solo entre tu computadora y los servidores de Google. Los desarrolladores de nimbo
 no operan servidores y nunca reciben, guardan, venden ni comparten tus archivos, nombres de archivo ni
 datos de tu cuenta. Tus tokens se guardan en el llavero de tu sistema operativo.</p>
