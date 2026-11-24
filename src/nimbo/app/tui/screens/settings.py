@@ -12,7 +12,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Input, Label, Static, TextArea
 from textual.worker import Worker
 
-from nimbo.core.config import Config, SafetyConfig, load_config, save_config
+from nimbo.core.config import Config, load_config, save_config
 from nimbo.core.errors import ConfigError, NimboError
 
 from ..widgets import line
@@ -127,7 +127,12 @@ class SettingsScreen(Panel[None]):
             cfg,
             source=replace(cfg.source, paused=paused),
             schedule=replace(cfg.schedule, daily_at=daily),
-            safety=SafetyConfig(deletes, ratio, min_files),
+            safety=replace(
+                cfg.safety,
+                max_deletes=deletes,
+                max_delete_ratio=ratio,
+                ratio_min_files=min_files,
+            ),
             exclude=exclude,
         )
         try:

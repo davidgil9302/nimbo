@@ -256,6 +256,33 @@ def test_brakes_ratio_uses_folder_count_independently() -> None:
     assert safety.evaluate_brakes(plan, SafetyConfig()).reasons == ("folder_ratio:Projects",)
 
 
+@pytest.mark.parametrize(("limit", "tripped"), [(6, False), (5, True)])
+def test_update_brake_total_counts_only_updates(limit: int, tripped: bool) -> None:
+    ops = [Op(OpKind.UPDATE, f"{folder}/{i}", "changed") for folder in "AB" for i in range(3)]
+    ops.extend(
+        Op(kind, f"A/{kind}-{i}", "metadata")
+        for kind in (OpKind.UPLOAD, OpKind.TOUCH, OpKind.MOVE, OpKind.ADOPT)
+        for i in range(50)
+    )
+    plan = Plan(ops, PlanStats(per_folder_remote_files={"A": 3, "B": 3}))
+    brake = safety.evaluate_brakes(plan, SafetyConfig(max_updates=limit))
+    assert brake.tripped is tripped
+    assert brake.reasons == (("too_many_updates",) if tripped else ())
+
+
+def test_update_brake_ratio_uses_top_level_folder_and_minimum_updates() -> None:
+    counts = {"Over": 50, "Equal": 50, "BelowMinimum": 49}
+    ops = [
+        Op(OpKind.UPDATE, f"{folder}/nested/{i}", "changed")
+        for folder, count in counts.items()
+        for i in range(count)
+    ]
+    plan = Plan(
+        ops, PlanStats(per_folder_remote_files={"Over": 99, "Equal": 100, "BelowMinimum": 49})
+    )
+    assert safety.evaluate_brakes(plan, SafetyConfig()).reasons == ("folder_update_ratio:Over",)
+
+
 @pytest.mark.parametrize(
     ("limit", "usage", "problem"),
     [(None, 99, False), (100, 10, False), (100, 11, True), (50, 99, True)],

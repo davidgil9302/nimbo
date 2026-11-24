@@ -436,7 +436,12 @@ def _pending(
         elif not plan.errors:
             console.print(Text(t("cli.no_changes")))
         if preview.brake.tripped:
-            console.print(Text(t("reason.needs_confirmation"), style="yellow"))
+            for reason in preview.brake.reasons:
+                code, _, folder = reason.partition(":")
+                message = _reason(t, code)
+                console.print(
+                    Text(f"{safe_label(folder)} · {message}" if folder else message, style="yellow")
+                )
         issues: Iterator[PlanIssue | ScanProblem] = chain(
             plan.errors, plan.warnings, preview.scan_problems
         )
@@ -657,30 +662,37 @@ def _approve(paths: Paths, cfg: Config, t: Translator, console: Console, *, yes:
     if last is None or last.result is not RunResult.NEEDS_CONFIRMATION or not last.fingerprint:
         console.print(Text(t("cli.no_confirmation")))
         return 3
-    console.print(Text(t("reason.needs_confirmation")))
+    overwrites = last.reason == safety.OVERWRITE_CONFIRMATION
+    reason = last.reason if overwrites else "needs_confirmation"
+    console.print(Text(_reason(t, reason)))
     table = Table(show_edge=False)
+    if overwrites:
+        table.add_column(t("cli.label.operation"))
     table.add_column(t("cli.label.path"))
     table.add_column(t("cli.label.affected_files"), justify="right")
-    entries = [entry.rsplit("\t", 1) for entry in last.trash_preview]
-    if len(last.trash_preview) >= 500:
+    if overwrites or len(last.trash_preview) >= 500:
         engine, close = build_engine(paths, cfg)
         with _close_after(close):
             preview = engine.preview()
         if preview.plan.errors or preview.brake.fingerprint != last.fingerprint:
             console.print(Text(t("cli.confirmation_changed")))
             return 4
-        entries = [
-            [op.rel, str(op.affected_files)]
-            for op in sorted(preview.plan.ops, key=lambda op: op.rel)
-            if op.kind is OpKind.TRASH
-        ]
-    for entry in entries:
-        table.add_row(
-            Text(safe_label(entry[0])),
-            Text(safe_label(entry[1])) if len(entry) == 2 else t("common.unknown"),
-        )
+        for op in sorted(preview.plan.ops, key=lambda op: op.rel):
+            if op.kind is OpKind.TRASH:
+                operation = [t("cli.op.trash")] if overwrites else []
+                table.add_row(*operation, Text(safe_label(op.rel)), str(op.affected_files))
+            elif op.kind is OpKind.UPDATE and overwrites:
+                table.add_row(t("cli.op.overwrite"), Text(safe_label(op.rel)), "1")
+    else:
+        for item in last.trash_preview:
+            entry = item.rsplit("\t", 1)
+            table.add_row(
+                Text(safe_label(entry[0])),
+                Text(safe_label(entry[1])) if len(entry) == 2 else t("common.unknown"),
+            )
     console.print(table)
-    if not yes and not wizard.confirm(t, console, t("cli.confirm_trash")):
+    prompt = "cli.confirm_changes" if overwrites else "cli.confirm_trash"
+    if not yes and not wizard.confirm(t, console, t(prompt)):
         return 4
     validate_state_paths(paths)
     with RunLock(paths.lock_file):

@@ -14,7 +14,7 @@ settings = "Settings"
 diagnostics = "Diagnostics"
 quit = "Quit"
 back = "Back"
-review = "Review deletions"
+review = "Review changes"
 review_short = "Review"
 confirm = "Confirm and back up"
 undo = "Undo deletions"
@@ -112,9 +112,12 @@ save_failed = "Settings could not be saved. Check the configuration file and try
 units_failed = "Settings saved. The timer could not be updated. Check systemd and retry Save."
 
 [tui.confirm]
-notice = "The last backup paused to review deletions."
+notice = "The last backup paused for confirmation."
 title = "Review deletions"
 description = "Confirm that these items can be moved to the Google Drive trash."
+changes_title = "Review backup changes"
+overwrite_path = "{path} · overwrite in Drive"
+trash_path = "{path} · move to trash"
 path = "{path} · {files}"
 stale = "This approval is no longer current. Review the latest backup or run `backup now` to prepare a fresh list."
 working = "Requesting backup…"
@@ -126,6 +129,10 @@ other = "{count} items to move to the trash"
 [tui.confirm.files]
 one = "{count} file"
 other = "{count} files"
+
+[tui.confirm.changes]
+one = "{count} change to review"
+other = "{count} changes to review"
 
 [tui.diagnostics]
 command = "Run `backup diagnostico` to check the backup setup."

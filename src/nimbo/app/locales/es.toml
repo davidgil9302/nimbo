@@ -5,6 +5,7 @@ ok = "El respaldo terminó."
 partial = "Algunos cambios quedaron pendientes. Revisa el historial y vuelve a respaldar."
 failed = "El respaldo se interrumpió por un error. Revisa el historial para saber qué pasó."
 needs_confirmation = "Hay elementos por enviar a la papelera. Revisa la lista y confirma si quieres continuar."
+overwrite_confirmation = "Este respaldo sobrescribiría archivos en Drive. Revisa los cambios propuestos antes de confirmar."
 skipped = "El respaldo se omitió. Revisa el estado para saber qué falta."
 cancelled = "El respaldo se detuvo. Puedes iniciarlo de nuevo cuando quieras."
 paused = "El respaldo quedó en pausa. Los cambios pendientes se retomarán en el próximo respaldo."
@@ -25,6 +26,7 @@ preflight_failed = "El respaldo no pudo empezar. Ejecuta backup diagnostico para
 secret_store_unavailable = "El almacén de claves no está disponible. Inicia sesión en tu escritorio y vuelve a intentarlo."
 secret_store_locked = "El almacén de claves está bloqueado. Desbloquéalo en tu escritorio y vuelve a intentarlo."
 auth_failed = "Nimbo no pudo iniciar sesión en Google. Ejecuta backup conectar para volver a vincular tu cuenta."
+account_changed = "La cuenta de Google conectada no coincide con la de este respaldo. Ejecuta backup conectar con la cuenta original o usa backup instalar para configurar otra cuenta."
 reauth_required = "La autorización de Google dejó de ser válida. Ejecuta backup conectar para renovar el acceso a tu Drive."
 auth_denied = "No se concedió acceso a tu Drive. Ejecuta backup conectar y, si quieres continuar, concede el acceso en Google."
 auth_timeout = "Se agotó el tiempo para autorizar el acceso. Ejecuta backup conectar y completa el paso en el navegador."
@@ -89,6 +91,8 @@ foreign-item-kept = "Se conservó el elemento en Drive porque pertenece a otro p
 trash-took-new-items = "Este elemento no estaba en la lista verificada y se movió a la papelera junto con su carpeta. Puedes recuperarlo al deshacer esta ejecución."
 folder_ratio = "Una carpeta perdería gran parte de sus elementos en Drive. Revisa la lista de elementos antes de confirmar."
 too_many_deletes = "El plan supera el límite de elementos que se pueden enviar a la papelera sin confirmación. Revisa la lista antes de continuar."
+folder_update_ratio = "Este respaldo sobrescribiría gran parte de los archivos de esta carpeta en Drive. Revisa los cambios antes de confirmar."
+too_many_updates = "Este respaldo supera el límite de archivos que se pueden sobrescribir en Drive sin confirmación. Revisa los cambios antes de continuar."
 unsafe_restore_path = "La ubicación original no se puede usar de forma segura. Revisa la ruta antes de restaurar."
 restore_exists = "Ya existe un elemento en esta ruta y se conservó."
 unsafe_restore_target = "Nimbo no pudo verificar el destino de la restauración. Revisa la carpeta original en tu Drive."
@@ -117,6 +121,9 @@ body = "Revisa el historial para saber qué pasó antes de volver a respaldar."
 [notify.needs_confirmation]
 title = "Hay elementos por enviar a la papelera"
 body = "Ejecuta backup ahora --confirmar para revisar la lista y decidir si quieres continuar."
+
+[notify.overwrite_confirmation]
+title = "Hay sobrescrituras en Drive por confirmar"
 
 [notify.paused]
 title = "Respaldo en pausa"

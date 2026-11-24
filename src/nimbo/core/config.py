@@ -72,11 +72,14 @@ class ScheduleConfig:
 
 @dataclass(frozen=True, slots=True)
 class SafetyConfig:
-    """Deletion thresholds for the whole plan and for individual folders."""
+    """Deletion and overwrite thresholds for the whole plan and individual folders."""
 
     max_deletes: int = 500
     max_delete_ratio: float = 0.10
     ratio_min_files: int = 20
+    max_updates: int = 1000
+    max_update_ratio: float = 0.5
+    update_ratio_min_files: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +190,27 @@ def _load_source(source: _Table) -> SourceConfig:
     return SourceConfig(path, folders, paused, source.get("require_mount", bool, True))
 
 
+def _load_safety(safety: _Table) -> SafetyConfig:
+    defaults = SafetyConfig()
+
+    def ratio(key: str, default: float) -> float:
+        value = safety.number(key, default, 0, 1)
+        if value == 0:
+            raise ConfigError(f"safety.{key}")
+        return value
+
+    return SafetyConfig(
+        max_deletes=safety.integer("max_deletes", defaults.max_deletes),
+        max_delete_ratio=ratio("max_delete_ratio", defaults.max_delete_ratio),
+        ratio_min_files=safety.integer("ratio_min_files", defaults.ratio_min_files),
+        max_updates=safety.integer("max_updates", defaults.max_updates),
+        max_update_ratio=ratio("max_update_ratio", defaults.max_update_ratio),
+        update_ratio_min_files=safety.integer(
+            "update_ratio_min_files", defaults.update_ratio_min_files
+        ),
+    )
+
+
 def _load_transfer(transfer: _Table) -> TransferConfig:
     defaults = TransferConfig()
     chunk = transfer.integer("chunk_mib", defaults.chunk_mib, 1, 256)
@@ -241,22 +265,12 @@ def load_config(path: Path) -> Config:
     if not _DAILY_AT.fullmatch(daily_at):
         raise ConfigError("schedule.daily_at")
 
-    safety = top.section("safety", {"max_deletes", "max_delete_ratio", "ratio_min_files"})
-    defaults = SafetyConfig()
-    ratio = safety.number("max_delete_ratio", defaults.max_delete_ratio, 0, 1)
-    if ratio == 0:
-        raise ConfigError("safety.max_delete_ratio")
-
     cfg = Config(
         source=source,
         target=TargetConfig(folder_id, target.get("label", str, "")),
         oauth=OAuthConfig(client_id, client_secret),
         schedule=ScheduleConfig(daily_at),
-        safety=SafetyConfig(
-            safety.integer("max_deletes", defaults.max_deletes),
-            ratio,
-            safety.integer("ratio_min_files", defaults.ratio_min_files),
-        ),
+        safety=_load_safety(top.section("safety", {field.name for field in fields(SafetyConfig)})),
         transfer=_load_transfer(
             top.section(
                 "transfer",

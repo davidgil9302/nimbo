@@ -22,7 +22,17 @@ from nimbo.core.config import load_config, save_config
 from nimbo.core.fsutil import read_json
 from nimbo.core.index import Index
 from nimbo.core.lock import RunLock
-from nimbo.core.model import FolderStat, RunResult
+from nimbo.core.model import (
+    BrakeDecision,
+    FolderStat,
+    Op,
+    OpKind,
+    Plan,
+    PlanStats,
+    Preview,
+    RunResult,
+)
+from nimbo.core.safety import OVERWRITE_CONFIRMATION
 
 
 async def settle(pilot):
@@ -283,19 +293,51 @@ def test_settings_validation_and_save(dashboard, scenario):
     asyncio.run(run())
 
 
-def test_confirm_screen_writes_approval_and_starts(dashboard, scenario):
+def test_settings_save_preserves_overwrite_thresholds(dashboard, scenario):
+    safety = replace(
+        scenario.cfg.safety, max_updates=7, max_update_ratio=0.2, update_ratio_min_files=5
+    )
+    save_config(replace(scenario.cfg, safety=safety), scenario.paths.config_file)
+
+    async def run():
+        app = dashboard()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("c")
+            await settle(pilot)
+            assert isinstance(app.screen, SettingsScreen)
+            app.screen.query_one("#max-deletes", Input).value = "120"
+            assert await pilot.click("#settings-save")
+            await settle(pilot)
+            saved = load_config(scenario.paths.config_file)
+            assert saved.safety == replace(safety, max_deletes=120)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("overwrites", [False, True], ids=["deletions", "overwrites"])
+def test_confirm_screen_writes_approval_and_starts(dashboard, scenario, monkeypatch, overwrites):
+    if overwrites:
+        plan = Plan([Op(OpKind.UPDATE, "Documents/Field notes.pdf", "changed")], PlanStats())
+        preview = Preview(plan, [], None, BrakeDecision(True, ("too_many_updates",), "test"))
+        monkeypatch.setattr(scenario, "preview", lambda *, stop: preview)
+
     async def run():
         scenario.record_run(
             RunResult.NEEDS_CONFIRMATION,
             fingerprint="test",
-            trash_preview=["Projects/Archive\t18"],
+            reason=OVERWRITE_CONFIRMATION if overwrites else "",
+            trash_preview=[] if overwrites else ["Projects/Archive\t18"],
         )
         app = dashboard()
         async with app.run_test() as pilot:
             await settle(pilot)
             await pilot.press("r")
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, ConfirmScreen)
+            if overwrites:
+                rows = app.screen.query_one(".deletion-row", Static).render().plain
+                assert rows == "Documents/Field notes.pdf · overwrite in Drive"
             assert not scenario.paths.approval_file.exists()
             await pilot.click("#confirm-start")
             await settle(pilot)

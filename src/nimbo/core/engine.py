@@ -41,6 +41,7 @@ from .model import (
     INVALID_NAME_PREFIX,
     About,
     AuditReport,
+    BrakeDecision,
     FolderStat,
     Op,
     OpKind,
@@ -65,6 +66,7 @@ from .planner import PlannerOptions, make_plan
 from .progress import ProgressTracker
 from .remote_sync import RemoteIndexer
 from .safety import (
+    OVERWRITE_CONFIRMATION,
     check_source,
     check_space,
     consume_approval,
@@ -119,6 +121,7 @@ class _Prepared:
     indexer: RemoteIndexer
     scanned: ScanResult
     plan: Plan
+    brake: BrakeDecision
     deep: bool
 
 
@@ -414,7 +417,11 @@ class Engine:
             about = deps.drive.about()
         except AuthError as exc:
             raise _PreflightError(exc.code, exc.detail, result=RunResult.FAILED) from exc
-        index.set_meta(META_ACCOUNT, about.email)
+        recorded_account = index.get_meta(META_ACCOUNT)
+        if recorded_account is None:
+            index.set_meta(META_ACCOUNT, about.email)
+        elif recorded_account != about.email:
+            raise _PreflightError("account_changed", result=RunResult.FAILED)
         index.set_meta(META_QUOTA_LIMIT, None if about.limit is None else str(about.limit))
         index.set_meta(META_QUOTA_USED, str(about.usage))
         self._reset_target()
@@ -470,8 +477,17 @@ class Engine:
             verify_same_metadata=True,
             mapped_id=mapped_id,
         )
+
+        def update_digest(op: Op) -> str:
+            # An approval must cover the bytes even when size and mtime stayed fixed.
+            digest = hasher.md5(scanned.entries[op.rel], force=True)
+            if digest is None:
+                raise _PreflightError("file_in_use", op.rel, result=RunResult.FAILED)
+            return digest
+
+        brake = evaluate_brakes(plan, cfg.safety, update_digest=update_digest)
         _check_stop(stop)
-        return _Prepared(root_uuid, about, indexer, scanned, plan, deep)
+        return _Prepared(root_uuid, about, indexer, scanned, plan, brake, deep)
 
     def _deep_due(self) -> bool:
         deps = self._deps
@@ -501,13 +517,15 @@ class Engine:
             raise _PreflightError(
                 problem.code, problem.detail or problem.rel, result=RunResult.FAILED
             )
-        brake = evaluate_brakes(plan, deps.cfg.safety)
+        brake = prepared.brake
         if brake.tripped and not (
             allow_brakes
             or consume_approval(deps.paths.approval_file, brake.fingerprint, now=deps.clock())
         ):
             summary.result = RunResult.NEEDS_CONFIRMATION
             summary.fingerprint = brake.fingerprint
+            if plan.stats.updates:
+                summary.reason = OVERWRITE_CONFIRMATION
             trashes = sorted(
                 (op for op in plan.ops if op.kind is OpKind.TRASH), key=lambda op: op.rel
             )
@@ -666,7 +684,7 @@ class Engine:
                 prepared.plan,
                 prepared.scanned.problems,
                 prepared.about,
-                evaluate_brakes(prepared.plan, deps.cfg.safety),
+                prepared.brake,
             )
 
     def undo(self, run_id: int | None = None, *, stop: Event | None = None) -> UndoSummary:

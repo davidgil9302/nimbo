@@ -49,6 +49,9 @@ daily_at = "20:00"
 max_deletes = 500
 max_delete_ratio = 0.10
 ratio_min_files = 20
+max_updates = 1000
+max_update_ratio = 0.5
+update_ratio_min_files = 50
 
 [transfer]
 parallel_uploads = 4
@@ -81,6 +84,9 @@ client_secret = "<Desktop client secret>"
 | `safety.max_deletes` | `500` | Ask for confirmation when the plan would trash more than this many files in total. |
 | `safety.max_delete_ratio` | `0.10` | Ask for confirmation when the share of a folder's indexed files to be trashed exceeds this fraction and meets the minimum count below. Valid values are greater than 0 and at most 1. |
 | `safety.ratio_min_files` | `20` | Minimum number of deletions in a folder before its deletion ratio is checked. |
+| `safety.max_updates` | `1000` | Ask for confirmation when the plan would overwrite the contents of more than this many existing Drive files in total. |
+| `safety.max_update_ratio` | `0.5` | Ask for confirmation when the share of a top-level folder's backed-up files to be overwritten exceeds this fraction and meets the minimum count below. Valid values are greater than 0 and at most 1. |
+| `safety.update_ratio_min_files` | `50` | Minimum number of overwrites in a top-level folder before its overwrite ratio is checked. |
 | `transfer.parallel_uploads` | `4` | Concurrent uploads, from 1 to 16. |
 | `transfer.chunk_mib` | `32` | Resumable chunk size in MiB, from 1 to 256. |
 | `transfer.multipart_max_mib` | `8` | Multipart size threshold in MiB, from 1 through `chunk_mib`. Set this explicitly when lowering the chunk size below 8 MiB. |
@@ -93,6 +99,11 @@ The ratio brake applies only when the number of planned file deletions in a
 folder reaches `safety.ratio_min_files`. A folder with fewer files than that
 threshold is exempt from the ratio brake. The separate total limit,
 `safety.max_deletes`, still applies.
+
+The overwrite brake counts content updates to existing Drive files. New uploads,
+renames and timestamp changes are excluded. Either brake pauses the backup for
+review in the dashboard or with `backup now --confirm`. An approval is valid for
+the reviewed changes for 24 hours and is consumed when a paused plan is checked.
 
 Between deep comparisons, routine backups can reuse cached hashes for files
 whose size and modification time match. Use `backup verificar` to rehash file

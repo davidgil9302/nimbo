@@ -5,6 +5,7 @@ ok = "The backup finished."
 partial = "Some changes are still pending. Check the history and run the backup again."
 failed = "An error interrupted the backup. Check the history to see what happened."
 needs_confirmation = "Some items are ready to move to the trash. Review the list and confirm if you want to continue."
+overwrite_confirmation = "This backup would overwrite files in Drive. Review the proposed changes before confirming."
 skipped = "The backup was skipped. Check the status to see what needs attention."
 cancelled = "The backup stopped. You can start it again whenever you're ready."
 paused = "The backup is paused. Pending changes will resume with the next backup."
@@ -25,6 +26,7 @@ preflight_failed = "The backup couldn't start. Run backup doctor to see what nee
 secret_store_unavailable = "The keyring is unavailable. Sign in to your desktop and try again."
 secret_store_locked = "The keyring is locked. Unlock it on your desktop and try again."
 auth_failed = "Nimbo couldn't sign in to Google. Run backup connect to link your account again."
+account_changed = "The connected Google account doesn't match this backup. Run backup connect with the original account, or run backup install to set up a different account."
 reauth_required = "Your Google authorization is no longer valid. Run backup connect to restore access to your Drive."
 auth_denied = "Access to your Drive was denied. Run backup connect and, if you'd like to continue, grant access in Google."
 auth_timeout = "The authorization timed out. Run backup connect and complete the step in your browser."
@@ -89,6 +91,8 @@ foreign-item-kept = "The Drive item was kept because it belongs to another owner
 trash-took-new-items = "This item was not on the verified list and went to the trash with its folder. You can recover it by undoing this run."
 folder_ratio = "A large share of a folder's items would move to the trash in Drive. Review the list before confirming."
 too_many_deletes = "The plan exceeds the limit on items that can move to the trash without confirmation. Review the list before continuing."
+folder_update_ratio = "This backup would overwrite a large share of this folder's files in Drive. Review the changes before confirming."
+too_many_updates = "This backup would overwrite more files in Drive than the limit allows without confirmation. Review the changes before continuing."
 unsafe_restore_path = "The original location can't be used safely. Review the path before restoring."
 restore_exists = "An item already exists at this path and was kept."
 unsafe_restore_target = "Nimbo couldn't verify the restore destination. Check the original folder in your Drive."
@@ -117,6 +121,9 @@ body = "Check the history to see what happened before running the backup again."
 [notify.needs_confirmation]
 title = "Some items are ready to move to the trash"
 body = "Run backup now --confirmar to review the list and decide whether to continue."
+
+[notify.overwrite_confirmation]
+title = "Drive overwrites need confirmation"
 
 [notify.paused]
 title = "Backup paused"

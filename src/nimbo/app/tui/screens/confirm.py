@@ -1,4 +1,4 @@
-"""Review the exact deletion proposal before approving a new backup."""
+"""Review proposed deletions and overwrites before approving a backup."""
 
 import fcntl
 import os
@@ -19,7 +19,7 @@ from nimbo.core.errors import LockedError, NimboError
 from nimbo.core.fsutil import read_json
 from nimbo.core.lock import RunLock, is_locked
 from nimbo.core.model import OpKind, RunResult, RunSummary
-from nimbo.core.safety import write_approval
+from nimbo.core.safety import OVERWRITE_CONFIRMATION, write_approval
 
 from ..data import load_runs
 from ..widgets import line
@@ -49,11 +49,12 @@ def _revoke(path: Path, fingerprint: str, expires: datetime) -> None:
 
 
 class ConfirmScreen(Panel[None]):
-    """List a paused run's proposed deletions and ask for explicit approval."""
+    """List the changes awaiting approval for a paused run."""
 
     def __init__(self, run: RunSummary) -> None:
         super().__init__()
         self._run = run
+        self._overwrites = run.reason == OVERWRITE_CONFIRMATION
         self._config: Config | None = None
         self._worker: Worker[None] | None = None
 
@@ -76,7 +77,10 @@ class ConfirmScreen(Panel[None]):
         self._rows = Static("", classes="deletion-row", markup=False)
         self._total.display = self._rows.display = False
         with VerticalScroll(classes="panel-body"):
-            yield self.heading("tui.confirm.title", t("tui.confirm.description"))
+            if self._overwrites:
+                yield self.heading("tui.confirm.changes_title", t("reason.overwrite_confirmation"))
+            else:
+                yield self.heading("tui.confirm.title", t("tui.confirm.description"))
             yield self._status
             yield self._total
             yield self._rows
@@ -84,16 +88,16 @@ class ConfirmScreen(Panel[None]):
 
     def on_mount(self) -> None:
         """Prepare the entire saved or reconstructed proposal before offering approval."""
-        if not self._run.fingerprint or not self._run.trash_preview:
+        if not self._run.fingerprint or not (self._overwrites or self._run.trash_preview):
             self._status.update(self.t("tui.confirm.stale"))
             return
         self.start_job(self._load_review, self._show_review, self._review_failed)
 
-    def _load_review(self, stop: Event) -> tuple[Config, list[tuple[str, int | None]]]:
+    def _load_review(self, stop: Event) -> tuple[Config, list[tuple[OpKind, str, int | None]]]:
         app = self.nimbo
         cfg = load_config(app.paths.config_file)
-        if len(self._run.trash_preview) < _PREVIEW_LIMIT:
-            entries = [_preview_entry(item) for item in self._run.trash_preview]
+        if not self._overwrites and len(self._run.trash_preview) < _PREVIEW_LIMIT:
+            entries = [(OpKind.TRASH, *_preview_entry(item)) for item in self._run.trash_preview]
         else:
             factory = app.engine_factory
             if factory is None:
@@ -108,9 +112,9 @@ class ConfirmScreen(Panel[None]):
             if preview.plan.errors or preview.brake.fingerprint != self._run.fingerprint:
                 raise NimboError(code="tui.confirm.stale")
             entries = [
-                (op.rel, op.affected_files)
+                (op.kind, op.rel, op.affected_files)
                 for op in sorted(preview.plan.ops, key=lambda op: op.rel)
-                if op.kind is OpKind.TRASH
+                if op.kind is OpKind.TRASH or (self._overwrites and op.kind is OpKind.UPDATE)
             ]
         if not entries:
             raise NimboError(code="tui.confirm.stale")
@@ -128,16 +132,23 @@ class ConfirmScreen(Panel[None]):
         ):
             raise NimboError(code="tui.confirm.stale")
 
-    def _show_review(self, review: tuple[Config, list[tuple[str, int | None]]]) -> None:
+    def _show_review(self, review: tuple[Config, list[tuple[OpKind, str, int | None]]]) -> None:
         cfg, entries = review
         t = self.t
-        rows = [
-            line(path)
-            if count is None
-            else t("tui.confirm.path", path=line(path), files=t.plural("tui.confirm.files", count))
-            for path, count in entries
-        ]
-        self._total.update(t.plural("tui.confirm.items", len(entries)))
+        rows = []
+        for kind, path, count in entries:
+            label = line(path)
+            if kind is OpKind.UPDATE:
+                label = t("tui.confirm.overwrite_path", path=label)
+            elif count is not None:
+                label = t(
+                    "tui.confirm.path", path=label, files=t.plural("tui.confirm.files", count)
+                )
+                if self._overwrites:
+                    label = t("tui.confirm.trash_path", path=label)
+            rows.append(label)
+        total = "tui.confirm.changes" if self._overwrites else "tui.confirm.items"
+        self._total.update(t.plural(total, len(entries)))
         self._rows.update("\n\n".join(rows))
         self._status.display = False
         self._total.display = self._rows.display = True

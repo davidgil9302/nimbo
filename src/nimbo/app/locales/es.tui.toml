@@ -14,7 +14,7 @@ settings = "Ajustes"
 diagnostics = "Diagnóstico"
 quit = "Salir"
 back = "Volver"
-review = "Revisar borrados"
+review = "Revisar cambios"
 review_short = "Revisar"
 confirm = "Confirmar y respaldar"
 undo = "Deshacer borrados"
@@ -112,9 +112,12 @@ save_failed = "No se guardaron los ajustes. Revisa el archivo de configuración 
 units_failed = "Se guardaron los ajustes. Revisa systemd y vuelve a pulsar Guardar para actualizar el temporizador."
 
 [tui.confirm]
-notice = "El último respaldo se pausó para revisar borrados."
+notice = "El último respaldo se pausó en espera de confirmación."
 title = "Revisar borrados"
 description = "Confirma que estos elementos pueden enviarse a la papelera de Google Drive."
+changes_title = "Revisar cambios del respaldo"
+overwrite_path = "{path} · sobrescribir en Drive"
+trash_path = "{path} · enviar a la papelera"
 path = "{path} · {files}"
 stale = "Esta aprobación ya no está vigente. Revisa el último respaldo o ejecuta `backup ahora` para preparar una lista nueva."
 working = "Solicitando respaldo…"
@@ -126,6 +129,10 @@ other = "{count} elementos para enviar a la papelera"
 [tui.confirm.files]
 one = "{count} archivo"
 other = "{count} archivos"
+
+[tui.confirm.changes]
+one = "{count} cambio por revisar"
+other = "{count} cambios por revisar"
 
 [tui.diagnostics]
 command = "Ejecuta `backup diagnostico` para revisar la configuración del respaldo."

@@ -70,7 +70,7 @@ def test_load_minimal_config_uses_defaults(tmp_path: Path) -> None:
     assert cfg.target.label == ""
     assert cfg.schedule == ScheduleConfig("20:00")
     assert cfg.schedule.hour_minute == (20, 0)
-    assert cfg.safety == SafetyConfig(500, 0.10, 20)
+    assert cfg.safety == SafetyConfig(500, 0.10, 20, 1000, 0.5, 50)
     assert cfg.transfer == TransferConfig(4, 32, 8, 3.0, 10.0)
     assert cfg.service == "Google Drive"
     assert cfg.language is None
@@ -257,23 +257,18 @@ def test_invalid_daily_at(tmp_path: Path, hour: str | int) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "key", ["max_deletes", "ratio_min_files", "max_updates", "update_ratio_min_files"]
+)
 @pytest.mark.parametrize("value", ["-1", "true", "4.0"])
-def test_invalid_max_deletes(tmp_path: Path, value: str) -> None:
-    _assert_invalid(tmp_path, _MINIMAL + f"\n[safety]\nmax_deletes = {value}", "safety.max_deletes")
+def test_invalid_safety_count(tmp_path: Path, key: str, value: str) -> None:
+    _assert_invalid(tmp_path, _MINIMAL + f"\n[safety]\n{key} = {value}", f"safety.{key}")
 
 
+@pytest.mark.parametrize("key", ["max_delete_ratio", "max_update_ratio"])
 @pytest.mark.parametrize("value", ["0", "-0.1", "1.01", "true", "nan", "+inf", "-inf"])
-def test_invalid_max_delete_ratio(tmp_path: Path, value: str) -> None:
-    _assert_invalid(
-        tmp_path, _MINIMAL + f"\n[safety]\nmax_delete_ratio = {value}", "safety.max_delete_ratio"
-    )
-
-
-@pytest.mark.parametrize("value", ["-1", "true", "20.0"])
-def test_invalid_ratio_min_files(tmp_path: Path, value: str) -> None:
-    _assert_invalid(
-        tmp_path, _MINIMAL + f"\n[safety]\nratio_min_files = {value}", "safety.ratio_min_files"
-    )
+def test_invalid_safety_ratio(tmp_path: Path, key: str, value: str) -> None:
+    _assert_invalid(tmp_path, _MINIMAL + f"\n[safety]\n{key} = {value}", f"safety.{key}")
 
 
 @pytest.mark.parametrize("value", ["0", "17", "true", "4.0"])
@@ -403,6 +398,9 @@ def test_config_accepts_numeric_bounds(tmp_path: Path) -> None:
 max_deletes = 0
 max_delete_ratio = 1
 ratio_min_files = 0
+max_updates = 0
+max_update_ratio = 1
+update_ratio_min_files = 0
 [transfer]
 parallel_uploads = 1
 chunk_mib = 1
@@ -411,7 +409,8 @@ writes_per_second = 20
 reads_per_second = 0.1
 """,
     )
-    assert cfg.safety == SafetyConfig(0, 1.0, 0)
+    assert cfg.safety == SafetyConfig(0, 1.0, 0, 0, 1.0, 0)
+    assert _load(tmp_path, dumps_config(cfg)).safety == cfg.safety
     assert cfg.transfer == TransferConfig(1, 1, 1, 20.0, 0.1)
 
 

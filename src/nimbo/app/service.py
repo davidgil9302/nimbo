@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from nimbo.core.fsutil import atomic_write_text, read_json, write_json
 from nimbo.core.model import RunResult, RunSummary, utc_now_iso
 from nimbo.core.paths import Paths
+from nimbo.core.safety import OVERWRITE_CONFIRMATION
 
 from .i18n import Translator
 
@@ -342,7 +343,12 @@ class DesktopNotifier:
         if result is RunResult.CANCELLED or (manual_only and not manual):
             return
         t = self._t
-        title = t(f"notify.{result}.title")
+        notice = (
+            OVERWRITE_CONFIRMATION
+            if result is RunResult.NEEDS_CONFIRMATION and summary.reason == OVERWRITE_CONFIRMATION
+            else result
+        )
+        title = t(f"notify.{notice}.title")
         urgent = result in {RunResult.FAILED, RunResult.NEEDS_CONFIRMATION}
         urgency = "critical" if urgent else "normal"
         args = ["notify-send", "-a", "nimbo", "-i", _NOTIFICATION_ICONS[result], "-u", urgency]

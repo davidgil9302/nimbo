@@ -1,4 +1,4 @@
-"""Local and remote preflight checks and single-use deletion approvals."""
+"""Local and remote preflight checks and single-use backup approvals."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import json
 import os
 import socket
 import stat
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -17,7 +18,18 @@ from pathlib import Path
 from nimbo.core.config import Config, SafetyConfig
 from nimbo.core.errors import SafetyError
 from nimbo.core.fsutil import read_json, write_json
-from nimbo.core.model import SENTINEL_NAME, About, BrakeDecision, OpKind, Plan, utc_now_iso
+from nimbo.core.model import (
+    SENTINEL_NAME,
+    About,
+    BrakeDecision,
+    Op,
+    OpKind,
+    Plan,
+    rel_top,
+    utc_now_iso,
+)
+
+OVERWRITE_CONFIRMATION = "overwrite_confirmation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,8 +152,13 @@ def network_available(
         return False
 
 
-def evaluate_brakes(plan: Plan, cfg: SafetyConfig) -> BrakeDecision:
-    """Check deletion statistics against the limits and bind the result to the plan."""
+def evaluate_brakes(
+    plan: Plan, cfg: SafetyConfig, *, update_digest: Callable[[Op], str] | None = None
+) -> BrakeDecision:
+    """Check deletion and overwrite limits and bind approval to the affected operations.
+
+    For a held plan, ``update_digest`` can supply fresh content digests for every update.
+    """
     stats = plan.stats
     reasons = [
         f"folder_ratio:{name}"
@@ -151,14 +168,39 @@ def evaluate_brakes(plan: Plan, cfg: SafetyConfig) -> BrakeDecision:
     ]
     if stats.trashed_files > cfg.max_deletes:
         reasons.append("too_many_deletes")
+    updates = [op for op in plan.ops if op.kind is OpKind.UPDATE]
+    per_folder_updates = Counter(rel_top(op.rel) for op in updates)
+    reasons.extend(
+        f"folder_update_ratio:{name}"
+        for name, count in per_folder_updates.items()
+        if count >= cfg.update_ratio_min_files
+        and count / max(1, stats.per_folder_remote_files.get(name, 0)) > cfg.max_update_ratio
+    )
+    if len(updates) > cfg.max_updates:
+        reasons.append("too_many_updates")
+
     fingerprint = plan.fingerprint()
     digests = sorted(
         op.trash_ids_digest
         for op in plan.ops
         if op.kind is OpKind.TRASH and op.trash_ids_digest is not None
     )
-    if digests:
-        payload = json.dumps([fingerprint, digests], separators=(",", ":"))
+    components: list[object] = [fingerprint, digests]
+    if updates:
+        components.append(
+            sorted(
+                (
+                    op.rel,
+                    op.file_id or "",
+                    op.size,
+                    op.mtime_ns,
+                    (update_digest(op) if reasons and update_digest is not None else op.md5) or "",
+                )
+                for op in updates
+            )
+        )
+    if digests or updates:
+        payload = json.dumps(components, separators=(",", ":"))
         fingerprint = hashlib.sha256(payload.encode("ascii")).hexdigest()
     return BrakeDecision(bool(reasons), tuple(sorted(reasons)), fingerprint)
 
