@@ -202,10 +202,16 @@ def test_second_start_request_aborts_the_signin(
         httpx.Client(trust_env=False, timeout=2) as browser,
     ):
         consent_url = _follow_start(attacker, url)
-        repeated = browser.get(url)
-        assert repeated.status_code >= 400 and "location" not in repeated.headers
         params = httpx.URL(consent_url).params
-        assert params["state"] not in repeated.text
+        # The abort may close the listener before this response is written; either
+        # outcome is fine as long as the second requester never sees the consent URL.
+        try:
+            repeated = browser.get(url)
+        except httpx.TransportError:
+            pass
+        else:
+            assert repeated.status_code >= 400 and "location" not in repeated.headers
+            assert params["state"] not in repeated.text
         code = fake.oauth.authorize(
             params["client_id"],
             params["redirect_uri"],
