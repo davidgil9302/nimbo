@@ -304,6 +304,21 @@ class DriveClient:
         except NotFound:
             return None
 
+    def live_folder_in_subtree(self, folder_id: str, root_id: str) -> bool:
+        """Check live folder membership by following Drive's current parent links."""
+        seen: set[str] = set()
+        while folder_id not in seen:
+            seen.add(folder_id)
+            folder = self.get(folder_id)
+            if folder is None or folder.trashed or not folder.is_folder:
+                break
+            if folder.id == root_id or folder_id == root_id:
+                return True
+            if len(folder.parents) != 1:
+                break
+            folder_id = folder.parents[0]
+        return False
+
     def list_children(
         self,
         parent_ids: Sequence[str],
@@ -570,6 +585,7 @@ class DriveClient:
         *,
         on_send: Callable[[int], None] | None = None,
         recover: Callable[[], int | RemoteFile | None] | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> int | RemoteFile:
         if not (size == offset == len(chunk) == 0 or 0 <= offset < offset + len(chunk) <= size):
             raise ValueError("Chunk does not fit the upload bounds")
@@ -581,6 +597,11 @@ class DriveClient:
                 raise ServerError("Drive did not advance the resumable upload", status=308)
             return position
 
+        def body() -> Iterable[bytes]:
+            if before_send is not None:
+                before_send()
+            return _media_body(chunk, on_send)
+
         return self._request(
             "PUT",
             self._session_url(url),
@@ -590,7 +611,7 @@ class DriveClient:
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {byte_range}/{size}",
             },
-            content=lambda: _media_body(chunk, on_send),
+            content=body,
             session=True,
             retry_http=recover is not None,
             recover=recover,

@@ -373,13 +373,16 @@ class Index:
     def put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
         """Store the latest cached hash and file metadata for ``rel``."""
         with self._transaction(write=True):
-            self._execute(
-                "INSERT INTO local_hash (rel, size, mtime_ns, md5, hashed_at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(rel) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns, "
-                "md5=excluded.md5, hashed_at=excluded.hashed_at",
-                (rel, size, mtime_ns, md5, utc_now_iso()),
-            )
+            self._put_hash(rel, size, mtime_ns, md5)
+
+    def _put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
+        self._execute(
+            "INSERT INTO local_hash (rel, size, mtime_ns, md5, hashed_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(rel) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns, "
+            "md5=excluded.md5, hashed_at=excluded.hashed_at",
+            (rel, size, mtime_ns, md5, utc_now_iso()),
+        )
 
     def prune_hashes(self, keep: Collection[str]) -> int:
         """Remove hashes for paths outside ``keep`` and return the number removed."""
@@ -500,8 +503,9 @@ class Index:
         remove_subtrees: Sequence[str] = (),
         trash_log_run: int | None = None,
         trashed_is_folder: bool = False,
+        local_md5: str | None = None,
     ) -> None:
-        """Mark an operation done together with its mirror and optional trash log changes.
+        """Mark an operation done with its mirror, trash log and verified digest changes.
 
         A trash log entry requires ``op.file_id``, otherwise ``ValueError`` is raised.
         """
@@ -509,6 +513,8 @@ class Index:
             self._update_op(op, OpState.DONE)
             self._upsert_remote(upsert)
             self._delete_remote(remove_subtrees)
+            if local_md5 is not None:
+                self._put_hash(op.rel, op.size, op.mtime_ns, local_md5)
             if trash_log_run is not None:
                 if op.file_id is None:
                     raise ValueError("A Drive file ID is required for the trash log")

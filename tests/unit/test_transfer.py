@@ -13,7 +13,14 @@ import httpx
 import pytest
 
 from nimbo.core.drive import DriveClient
-from nimbo.core.errors import Conflict, FileChanged, Md5Mismatch, ServerError, Stopped
+from nimbo.core.errors import (
+    Conflict,
+    FileChanged,
+    Md5Mismatch,
+    RemoteChanged,
+    ServerError,
+    Stopped,
+)
 from nimbo.core.index import Index
 from nimbo.core.model import EMPTY_MD5, PART_SUFFIX, drive_ms
 from nimbo.core.ratelimit import RateLimiter, RetryPolicy
@@ -207,6 +214,35 @@ def test_resume_after_simulated_crash_uses_stored_session(remote: _Harness, acti
     assert outcome.bytes_sent == len(_LARGE) - (_CHUNK if action == "crash_after" else 0)
     assert outcome.file.md5 == hashlib.md5(_LARGE).hexdigest()
     assert remote.session(req) is None
+
+
+@pytest.mark.parametrize("update", [False, True], ids=["create", "update"])
+def test_resume_rejects_session_under_moved_parent(remote: _Harness, update: bool) -> None:
+    """Reject a saved session before its status probe if its ancestor has left the mirror."""
+    target = remote.fake.add_folder("Target")
+    parent = remote.fake.add_folder("Parent", target)
+    outside = remote.fake.add_folder("Outside")
+    req = remote.request(update=update)
+    if update:
+        remote.drive.update_metadata(
+            req.file_id, add_parent=parent, remove_parents=[remote.fake.root_id]
+        )
+    else:
+        req = replace(req, parent_id=parent)
+
+    remote.fake.faults.add(Fault(_data_put, "crash_after"))
+    with pytest.raises(SimulatedCrash):
+        remote.uploader().upload(req, root_id=target)
+    assert remote.session(req) is not None
+    remote.drive.update_metadata(parent, add_parent=outside, remove_parents=[target])
+    before = remote.fake.snapshot(outside)
+    remote.fake.calls.clear()
+
+    with pytest.raises(RemoteChanged):
+        remote.uploader().upload(req, root_id=target)
+    assert remote.fake.calls and {call.method for call in remote.fake.calls} == {"GET"}
+    assert remote.session(req) is None
+    assert remote.fake.snapshot(outside) == before
 
 
 def test_expired_session_restarts(remote: _Harness) -> None:

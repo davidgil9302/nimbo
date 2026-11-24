@@ -23,6 +23,7 @@ from .errors import (
     NimboError,
     NotFound,
     RateLimited,
+    RemoteChanged,
     ServerError,
     Stopped,
     StorageQuotaExceeded,
@@ -104,10 +105,6 @@ class _Retry(Enum):
 
 class _LocalReadError(NimboError):
     pass
-
-
-class _RemoteChanged(NimboError):
-    code = "remote_changed"
 
 
 class _ProgressError(RuntimeError):
@@ -312,7 +309,7 @@ class Executor:
                 Md5Mismatch,
                 Stopped,
                 _LocalReadError,
-                _RemoteChanged,
+                RemoteChanged,
             ) as exc:
                 retry = self._failure(run, work, exc)
                 if op.kind in _UPLOAD:
@@ -334,7 +331,9 @@ class Executor:
                         trashed_is_folder=(previous if previous is not None else item).is_folder,
                     )
                 else:
-                    self._index.complete_op(op, upsert=[item])
+                    self._index.complete_op(
+                        op, upsert=[item], local_md5=item.md5 if op.kind in _UPLOAD else None
+                    )
                 run.report.done[op.kind] += 1
                 run.report.uploaded_bytes += uploaded
                 if op.kind is OpKind.MKDIR:
@@ -354,18 +353,18 @@ class Executor:
         if root is None:
             return
         if op.kind not in _CREATE and not self._index.in_subtree(file_id, root):
-            raise _RemoteChanged
+            raise RemoteChanged
         if op.kind in _WITH_PARENT:
             parent = op.parent_id
             assert parent is not None
             if not self._index.in_subtree(parent, root) and not (
-                parent in run.created_folders and self._live_folder_in_subtree(parent, root)
+                parent in run.created_folders and self._drive.live_folder_in_subtree(parent, root)
             ):
-                raise _RemoteChanged
+                raise RemoteChanged
         if op.kind is OpKind.TRASH:
             live = self._drive.get(file_id)
             if live is None or live.trashed:
-                raise _RemoteChanged
+                raise RemoteChanged
             if previous is None or previous.parents != live.parents:
                 if not self._refresh(run):
                     raise Stopped
@@ -378,22 +377,12 @@ class Executor:
                     or previous.parents != live.parents
                     or not self._index.in_subtree(file_id, root)
                 ):
-                    raise _RemoteChanged
+                    raise RemoteChanged
             # An ancestor can move without changing this item's direct parent.
-            if len(live.parents) != 1 or not self._live_folder_in_subtree(live.parents[0], root):
-                raise _RemoteChanged
-
-    def _live_folder_in_subtree(self, folder_id: str, root: str) -> bool:
-        seen = set()
-        while folder_id != root:
-            if folder_id in seen:
-                return False
-            seen.add(folder_id)
-            folder = self._drive.get(folder_id)
-            if folder is None or folder.trashed or not folder.is_folder or len(folder.parents) != 1:
-                return False
-            folder_id = folder.parents[0]
-        return True
+            if len(live.parents) != 1 or not self._drive.live_folder_in_subtree(
+                live.parents[0], root
+            ):
+                raise RemoteChanged
 
     def _apply(self, op: Op, file_id: str) -> tuple[RemoteFile, int]:
         if op.kind in _UPLOAD:
@@ -445,7 +434,7 @@ class Executor:
         )
         try:
             outcome = self._uploader.upload(
-                request, on_bytes=on_bytes, should_stop=self._stop.is_set
+                request, on_bytes=on_bytes, should_stop=self._stop.is_set, root_id=self._root_id
             )
         except FileNotFoundError as exc:
             raise _LocalReadError(code="local_vanished") from exc

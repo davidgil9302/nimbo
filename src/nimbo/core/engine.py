@@ -144,30 +144,32 @@ def _restore_parts(rel: str) -> tuple[str, ...]:
     return parts
 
 
-@contextmanager
-def _restore_parent(root: Path, root_fd: int, rel: str) -> Iterator[tuple[int, str]]:
-    parts = _restore_parts(rel)
-    parent = root.joinpath(*parts[:-1])
-    try:
-        resolved = parent.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise NimboError(code="unsafe_restore_path") from exc
-    if not resolved.is_relative_to(root):
+def _restore_name(parent_fd: int, component: str) -> str:
+    canonical = nfc(component)
+    matches = [name for name in os.listdir(parent_fd) if nfc(name) == canonical]
+    if len(matches) > 1:
         raise NimboError(code="unsafe_restore_path")
+    return matches[0] if matches else canonical
+
+
+@contextmanager
+def _restore_parent(root_fd: int, rel: str) -> Iterator[tuple[int, str]]:
+    parts = _restore_parts(rel)
     # Walk actual directory entries without following symlinks, even if one is
     # swapped in between the resolve check and the open. Pin each opened parent.
     parent_fd = os.dup(root_fd)
     try:
         for component in parts[:-1]:
+            name = _restore_name(parent_fd, component)
             try:
-                child_fd = os.open(component, _DIR_FLAGS, dir_fd=parent_fd)
+                child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
             except FileNotFoundError:
                 with suppress(FileExistsError):
-                    os.mkdir(component, dir_fd=parent_fd)
-                child_fd = os.open(component, _DIR_FLAGS, dir_fd=parent_fd)
+                    os.mkdir(name, dir_fd=parent_fd)
+                child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
             os.close(parent_fd)
             parent_fd = child_fd
-        yield parent_fd, parts[-1]
+        yield parent_fd, _restore_name(parent_fd, parts[-1])
     finally:
         os.close(parent_fd)
 
@@ -404,6 +406,7 @@ class Engine:
             matcher,
             lambda entry: hasher.md5(entry, force=deep),
             PlannerOptions(cfg.active_folders, root_uuid, deep, tuple(scanned.protected)),
+            verify_same_metadata=True,
         )
         _check_stop(stop)
         return _Prepared(root_uuid, about, indexer, scanned, plan, deep)
@@ -485,11 +488,21 @@ class Engine:
 
     def _reuse_upload_id(self, op: Op) -> str | None:
         if op.kind is OpKind.UPLOAD and op.parent_id is not None:
-            session = self._deps.index.get_session(
-                op.rel, op.size, op.mtime_ns, create_session_kind(op.parent_id)
-            )
+            key = (op.rel, op.size, op.mtime_ns, create_session_kind(op.parent_id))
+            session = self._deps.index.get_session(*key)
             if session is not None:
-                return session[0]
+                file_id, _ = session
+                item = self._deps.drive.get(file_id)
+                if item is None or (
+                    not item.trashed
+                    and not item.is_folder
+                    and item.parents == (op.parent_id,)
+                    and item.name == op.name
+                ):
+                    return file_id
+                # A committed create can leave its session in SQLite after a crash.
+                # If that file subsequently moved away, the plan needs a new ID.
+                self._deps.index.delete_session(*key)
         return None
 
     @staticmethod
@@ -597,7 +610,7 @@ class Engine:
             root = deps.cfg.source.root.resolve(strict=True)
             root_fd = os.open(root, _DIR_FLAGS)
             try:
-                return self._undo_locked(records, summary, root_uuid, root, root_fd, stop)
+                return self._undo_locked(records, summary, root_uuid, root_fd, stop)
             finally:
                 os.close(root_fd)
 
@@ -606,7 +619,6 @@ class Engine:
         records: list[tuple[str, str, bool]],
         summary: UndoSummary,
         root_uuid: str,
-        root: Path,
         root_fd: int,
         stop: Event,
     ) -> UndoSummary:
@@ -635,7 +647,7 @@ class Engine:
         self._reset_target()
         self._indexer(stop).refresh()
         for rel, item in restored:
-            self._restore_tree(root, root_fd, rel, item, root_uuid, summary, stop)
+            self._restore_tree(root_fd, rel, item, root_uuid, summary, stop)
         return summary
 
     def _check_restore_scope(self, item: RemoteFile, root_uuid: str, stop: Event) -> None:
@@ -661,7 +673,6 @@ class Engine:
 
     def _restore_tree(
         self,
-        root: Path,
         root_fd: int,
         rel: str,
         item: RemoteFile,
@@ -686,18 +697,24 @@ class Engine:
                 seen.add(item.id)
                 if item.owner_root not in (None, root_uuid):
                     raise NimboError(code="foreign-owner")
-                with _restore_parent(root, root_fd, rel) as (parent_fd, name):
+                with _restore_parent(root_fd, rel) as (parent_fd, name):
                     # Downloader needs a Path for exclusive staging and publish.
                     # The fd-backed path keeps both operations in the checked directory.
                     dest = Path(f"/proc/self/fd/{parent_fd}") / name
                     if os.path.lexists(dest):
                         summary.skipped_existing.append(rel)
                         continue
-                    if item.is_folder:
-                        os.mkdir(name, dir_fd=parent_fd)
-                    else:
-                        deps.downloader.download(item, dest, on_bytes=check_download_stop)
-                        summary.restored_files += 1
+                    try:
+                        if item.is_folder:
+                            os.mkdir(name, dir_fd=parent_fd)
+                        else:
+                            deps.downloader.download(item, dest, on_bytes=check_download_stop)
+                            summary.restored_files += 1
+                    except FileExistsError:
+                        if not os.path.lexists(dest):
+                            raise
+                        summary.skipped_existing.append(rel)
+                        continue
                 if item.is_folder:
                     folders.append((rel, item.modified_ms))
                     children = sorted(
@@ -717,11 +734,6 @@ class Engine:
                 raise
             except NimboError as exc:
                 summary.failed.append((rel, exc.code))
-            except FileExistsError:
-                if os.path.lexists(root / rel):
-                    summary.skipped_existing.append(rel)
-                else:
-                    summary.failed.append((rel, "restore_io_error"))
             except (NotADirectoryError, IsADirectoryError):
                 summary.failed.append((rel, "unsafe_restore_path"))
             except OSError:
@@ -732,7 +744,7 @@ class Engine:
                 continue
             _check_stop(stop)
             try:
-                with _restore_parent(root, root_fd, rel) as (parent_fd, name):
+                with _restore_parent(root_fd, rel) as (parent_fd, name):
                     folder_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
                     try:
                         ns = modified_ms * 1_000_000

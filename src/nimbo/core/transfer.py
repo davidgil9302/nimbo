@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from .drive import DriveClient
-from .errors import Conflict, FileChanged, Md5Mismatch, SessionExpired, Stopped
+from .errors import Conflict, FileChanged, Md5Mismatch, RemoteChanged, SessionExpired, Stopped
 from .model import PART_SUFFIX, RemoteFile, drive_ms
 
 _BLOCK = 256 << 10
@@ -107,11 +107,16 @@ def _check_stop(should_stop: Callable[[], bool] | None) -> None:
 
 class _UploadData:
     def __init__(
-        self, req: UploadRequest, source: BinaryIO, on_bytes: Callable[[int], None] | None
+        self,
+        req: UploadRequest,
+        source: BinaryIO,
+        on_bytes: Callable[[int], None] | None,
+        root_id: str | None,
     ) -> None:
         self.req = req
         self.source = source
         self._on_bytes = on_bytes
+        self.root_id = root_id
         self._digest = hashlib.md5(usedforsecurity=False)
         self.offset = 0
         self._reported = 0
@@ -187,14 +192,16 @@ class Uploader:
         *,
         on_bytes: Callable[[int], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        root_id: str | None = None,
     ) -> UploadOutcome:
         """Upload a scanned file, reporting newly confirmed bytes as positive deltas.
 
         Retry a size or checksum mismatch once as an update on the same ID.
         A create may reuse an existing non-folder file with a matching name and parent.
         Stopped leaves any pending session usable. FileChanged discards a stale
-        session. Md5Mismatch indicates unverified remote content. Local I/O and
-        typed Drive errors propagate to the caller.
+        session. When a root is supplied, RemoteChanged aborts resumable
+        transfers that lose live membership. Md5Mismatch indicates unverified
+        remote content. Local I/O and typed Drive errors propagate.
         """
         try:
             before = req.path.lstat()
@@ -202,7 +209,7 @@ class Uploader:
             _check_stop(should_stop)
             with _open_source(req) as source:
                 _check_source(req, source, before)
-                data = _UploadData(req, source, on_bytes)
+                data = _UploadData(req, source, on_bytes, root_id)
                 item = self._upload_verified(data, should_stop)
                 return UploadOutcome(item, data.md5, data.sent)
         except FileChanged:
@@ -315,6 +322,24 @@ class Uploader:
             data.reset()
         return None
 
+    def _check_mirror_scope(self, data: _UploadData) -> None:
+        root = data.root_id
+        if root is None:
+            return
+        req = data.req
+        item = self._drive.get(req.file_id)
+        parent = req.parent_id
+        if req.update:
+            parent = item.parents[0] if item is not None and len(item.parents) == 1 else None
+        if item is not None and (
+            item.trashed
+            or item.is_folder
+            or (not req.update and (item.parents != (parent,) or item.name != req.name))
+        ):
+            raise RemoteChanged(req.rel)
+        if parent is None or not self._drive.live_folder_in_subtree(parent, root):
+            raise RemoteChanged(req.rel)
+
     def _resumable(
         self,
         data: _UploadData,
@@ -343,6 +368,7 @@ class Uploader:
                     position: int | RemoteFile = 0
                 else:
                     url = saved[1]
+                    self._check_mirror_scope(data)
                     position = self._drive.resumable_status(url, req.size)
                 item = self._send_chunks(data, url, position, should_stop)
             except SessionExpired:
@@ -356,7 +382,7 @@ class Uploader:
                 data.reset()
                 saved = None
                 restarted = True
-            except Conflict:
+            except (Conflict, RemoteChanged):
                 self._sessions.delete_session(*key)
                 raise
             else:
@@ -380,14 +406,28 @@ class Uploader:
             _check_stop(should_stop)
             offset = position
             chunk = data.read(offset, min(self._chunk_size, size - offset))
+            final = offset + len(chunk) == size
 
-            def recover(previous: int = offset) -> int | RemoteFile | None:
+            def before_send() -> None:
+                self._check_mirror_scope(data)
+
+            def recover(
+                previous: int = offset, final_chunk: bool = final
+            ) -> int | RemoteFile | None:
                 _check_stop(should_stop)
+                if final_chunk:
+                    before_send()
                 status = self._drive.resumable_status(url, size)
                 return status if status != previous else None
 
             position = self._drive._put_chunk(
-                url, chunk, offset, size, on_send=data.count_sent, recover=recover
+                url,
+                chunk,
+                offset,
+                size,
+                on_send=data.count_sent,
+                recover=recover,
+                before_send=before_send if final else None,
             )
             data.confirm(size if isinstance(position, RemoteFile) else position, chunk)
         return position

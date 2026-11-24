@@ -111,6 +111,13 @@ class FileChanged(NimboError):
     code = "file_changed"
 
 
+class RemoteChanged(NimboError):
+    """The remote target left the mirror (moved or trashed outside the target folder)
+    while it was being uploaded. Nothing was committed; the run must re-plan it."""
+
+    code = "remote_changed"
+
+
 class Md5Mismatch(NimboError):
     code = "md5_mismatch"
 

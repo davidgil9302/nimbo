@@ -459,11 +459,18 @@ def _content_op(
     item: RemoteFile,
     check_hash: bool,
     md5_of: Callable[[LocalEntry], str | None],
+    *,
+    verify_same_metadata: bool,
 ) -> Op | None:
     same_time = drive_ms(entry.mtime_ns) == item.modified_ms
     md5 = None
     if entry.size == item.size:
-        if same_time and not check_hash and item.owner_root is not None:
+        if (
+            same_time
+            and not check_hash
+            and item.owner_root is not None
+            and not verify_same_metadata
+        ):
             return None
         md5 = md5_of(entry)
         if md5 is not None and md5 == item.md5:
@@ -537,12 +544,16 @@ def make_plan(
     matcher: MatcherLike,
     hash_of: Callable[[LocalEntry], str | None],
     options: PlannerOptions,
+    *,
+    verify_same_metadata: bool = False,
 ) -> Plan:
     """Return ordered mirror operations without changing either input snapshot.
 
     Local keys are NFC relative paths. The callback must supply a digest of
     current bytes or return None if unavailable. Read it lazily and cache both
-    results for this plan. A foreign owner or missing destination parent yields
+    results for this plan. Set `verify_same_metadata` when the callback can
+    reuse stored local digests to detect remote edits that preserve metadata.
+    A foreign owner or missing destination parent yields
     an error plan with no operations. Callback errors propagate to the caller.
 
     File writes carry the local mtime in nanoseconds. Folder operations and
@@ -587,7 +598,13 @@ def make_plan(
             if entry.is_dir:
                 plan.folder_ids[rel] = item.id
             elif rel not in moved_files:
-                op = _content_op(entry, item, options.deep or rel in relocated, md5_of)
+                op = _content_op(
+                    entry,
+                    item,
+                    options.deep or rel in relocated,
+                    md5_of,
+                    verify_same_metadata=verify_same_metadata,
+                )
                 if op is not None:
                     contents.append(op)
             continue

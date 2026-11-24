@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import socket
+from contextlib import ExitStack
 from http.client import HTTPResponse
 from io import BytesIO
 from socketserver import BaseServer
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import httpx
+import pytest
 
 from . import FakeDrive
 from .server import _RequestHandler
@@ -22,7 +25,14 @@ from .test_fake_uploads import UPLOAD, put, start
 def test_http_server_mode_roundtrip() -> None:
     fake = FakeDrive()
     fake.oauth.add_access_token("test-token")
-    with fake.serve() as base, httpx.Client(base_url=base, headers=AUTH, trust_env=False) as client:
+    with ExitStack() as resources:
+        try:
+            base = resources.enter_context(fake.serve())
+        except PermissionError as exc:
+            if exc.errno not in (errno.EPERM, errno.EACCES):
+                raise
+            pytest.skip(f"loopback HTTP is unavailable: {exc}")
+        client = resources.enter_context(httpx.Client(base_url=base, headers=AUTH, trust_env=False))
         assert base.startswith("http://127.0.0.1:")
         url = start(client, 3)
         assert url.startswith(base + "/")
