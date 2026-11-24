@@ -40,6 +40,7 @@ from .tree import RemoteTree, _rel_component
 _CREATE = {OpKind.MKDIR, OpKind.UPLOAD}
 _WITH_PARENT = _CREATE | {OpKind.MOVE}
 _UPLOAD = {OpKind.UPLOAD, OpKind.UPDATE}
+_CREATE_FOLDER_TTL = 60.0
 _PROGRESS_PHASE = {
     Phase.MKDIR: "mkdir",
     Phase.MOVE: "move",
@@ -60,6 +61,33 @@ class ExecReport:
     warnings: list[PlanIssue] = field(default_factory=list)
 
 
+class _CreateFolderCache:
+    def __init__(self, drive: DriveClient, root: str, clock: Callable[[], float]) -> None:
+        self._drive = drive
+        self._root = root
+        self._clock = clock
+        self._expiry: dict[tuple[str, str | None], float] = {}
+        self._lock = Lock()
+
+    def check(self, folder: str, rel: str | None) -> bool:
+        # Serialize cache misses so parallel uploads to a folder share its check.
+        with self._lock:
+            key = (folder, rel)
+            started_at = self._clock()
+            expiry = self._expiry.get(key)
+            if expiry is not None and started_at < expiry:
+                return True
+            if not self._drive.live_folder_in_subtree(folder, self._root, rel=rel):
+                self._expiry.pop(key, None)
+                return False
+            self._expiry[key] = started_at + _CREATE_FOLDER_TTL
+            return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._expiry.clear()
+
+
 @dataclass(slots=True)
 class _Run:
     id: int
@@ -67,13 +95,17 @@ class _Run:
     planned: RemoteTree
     moving: set[str]
     unconfirmed_trash: set[int]
+    create_folder_cache: _CreateFolderCache | None
     report: ExecReport = field(default_factory=lambda: ExecReport(Counter(), 0, [], None, []))
     lock: Lock = field(default_factory=Lock)
     aborted: Event = field(default_factory=Event)
     created_folders: set[str] = field(default_factory=set)
     pending_probe: list[str] = field(default_factory=list)
     last_refresh: float | None = None
+    ops_since_refresh: int = 0
+    refresh_requested: Event = field(default_factory=Event)
     refreshed: RemoteTree | None = None
+    names_by_parent: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     trash_followups: deque[_Work] = field(default_factory=deque)
     drift_rel: str | None = None
     index_dirty: bool = False
@@ -98,6 +130,17 @@ class _Run:
         if self.report.stop_reason is None and self.stop.is_set():
             self.report.stop_reason = "cancelled"
         return self.report.stop_reason is None and not self.aborted.is_set()
+
+    def matching_children(self, parent: str, name: str) -> Sequence[str]:
+        assert self.refreshed is not None
+        with self.lock:
+            names = self.names_by_parent.get(parent)
+            if names is None:
+                names = {}
+                for item in self.refreshed.children(parent):
+                    names.setdefault(_rel_component(item.name), []).append(item.id)
+                self.names_by_parent[parent] = names
+            return names.get(name, ())
 
 
 @dataclass(slots=True)
@@ -187,20 +230,23 @@ class Executor:
         root_id: str | None = None,
         refresh_remote: Callable[[], object] | None = None,
         refresh_every: float = 60.0,
+        refresh_ops: int = 500,
         clock: Callable[[], float] = time.monotonic,
         record_probe: Callable[[Sequence[str]], None] | None = None,
     ) -> None:
         """Bind the run's dependencies and set retry budgets.
 
         Guard writes under `root_id` when supplied. Refresh the mirror on the
-        scheduling thread before phases and after the given interval. Send
+        scheduling thread before phases and after the time or operation limit. Send
         newly created IDs to `record_probe` before consuming their feed window.
-        Raise ValueError for invalid retry budgets, parallelism or refresh interval.
+        Raise ValueError for invalid retry budgets, parallelism or refresh limits.
         """
         if parallel < 1 or changed_retries < 1 or md5_retries < 0:
             raise ValueError("Expected positive parallel and changed_retries, and md5_retries >= 0")
         if not math.isfinite(refresh_every) or refresh_every < 0:
             raise ValueError("refresh_every must be finite and nonnegative")
+        if refresh_ops < 1:
+            raise ValueError("refresh_ops must be positive")
         self._drive = drive
         self._uploader = uploader
         self._index = index
@@ -215,6 +261,7 @@ class Executor:
         self._root_id = root_id
         self._refresh_remote = refresh_remote
         self._refresh_every = refresh_every
+        self._refresh_ops = refresh_ops
         self._clock = clock
         self._record_probe = record_probe
 
@@ -237,16 +284,20 @@ class Executor:
                 raise ValueError(f"{op.kind} {op.rel!r} requires a name")
             phases[op.phase].append(_Work(op))
 
+        root = self._root_id
         run = _Run(
             run_id,
             self._stop,
-            self._index.load_tree(self._root_id or ""),
+            self._index.load_tree(root or ""),
             {op.file_id for op in ops if op.kind is OpKind.MOVE and op.file_id is not None},
             {
                 op.db_id
                 for op in self._index.inflight_ops()
                 if op.kind is OpKind.TRASH and op.db_id is not None
             },
+            _CreateFolderCache(self._drive, root, self._clock)
+            if root is not None and self._refresh_remote is not None
+            else None,
         )
         for phase, pending in phases.items():
             if not run.can_start() or not self._refresh(run):
@@ -264,6 +315,7 @@ class Executor:
                     if self._refresh_due(run) and not self._refresh(run):
                         break
                     work = pending.popleft()
+                    run.ops_since_refresh += 1
                     if self._execute_one(run, work):
                         pending.append(work)
                     pending.extendleft(reversed(run.trash_followups))
@@ -282,7 +334,11 @@ class Executor:
         return (
             self._refresh_remote is not None
             and run.last_refresh is not None
-            and self._clock() - run.last_refresh >= self._refresh_every
+            and (
+                run.refresh_requested.is_set()
+                or run.ops_since_refresh >= self._refresh_ops
+                or self._clock() - run.last_refresh >= self._refresh_every
+            )
         )
 
     def _refresh(self, run: _Run) -> bool:
@@ -314,10 +370,16 @@ class Executor:
             if force_full is not None and self._index.get_meta(META_FORCE_FULL) is None:
                 self._index.set_meta(META_FORCE_FULL, force_full)
         run.last_refresh = self._clock()
+        run.ops_since_refresh = 0
+        run.refresh_requested.clear()
         if root is not None:
             run.refreshed = self._index.load_tree(root)
-            if run.drift_rel is None:
-                run.drift_rel = _first_drift(before, run.refreshed)
+            run.names_by_parent.clear()
+            if (drift := _first_drift(before, run.refreshed)) is not None:
+                if run.drift_rel is None:
+                    run.drift_rel = drift
+                if run.create_folder_cache is not None:
+                    run.create_folder_cache.clear()
         run.index_dirty = False
         return run.can_start()
 
@@ -338,6 +400,7 @@ class Executor:
                     if self._refresh_due(run) and (active or not self._refresh(run)):
                         break
                     work = pending.popleft()
+                    run.ops_since_refresh += 1
                     active[pool.submit(self._execute_one, run, work)] = work
                 if not active:
                     break
@@ -413,6 +476,12 @@ class Executor:
                 run.index_dirty = True
                 if op.kind is OpKind.MKDIR:
                     run.created_folders.add(file_id)
+                if (
+                    op.kind is OpKind.MOVE
+                    and item.is_folder
+                    and run.create_folder_cache is not None
+                ):
+                    run.create_folder_cache.clear()
                 if op.kind in _CREATE:
                     if len(run.report.created_ids) < 20:
                         run.report.created_ids.append(file_id)
@@ -453,18 +522,32 @@ class Executor:
                 return
             if op.parent_rel is not None and refreshed.rel_of(parent) != op.parent_rel:
                 raise RemoteChanged
-            for item in refreshed.children(parent):
-                if item.id != file_id and _rel_component(item.name) == op.name:
-                    current = self._index.get_remote(item.id)
-                    if current is not None and parent in current.parents:
+            if op.name is not None:
+                for other_id in run.matching_children(parent, op.name):
+                    if other_id == file_id:
+                        continue
+                    current = self._index.get_remote(other_id)
+                    if (
+                        current is not None
+                        and not current.trashed
+                        and parent in current.parents
+                        and _rel_component(current.name) == op.name
+                    ):
                         raise RemoteChanged
 
-    def _check_destination(self, op: Op, file_id: str) -> None:
+    def _check_destination(
+        self, op: Op, file_id: str, cache: _CreateFolderCache | None = None
+    ) -> None:
         parent = op.parent_id
         root = self._root_id
         if root is None or parent is None:
             return
-        if not self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel):
+        in_scope = (
+            cache.check(parent, op.parent_rel)
+            if cache is not None
+            else self._drive.live_folder_in_subtree(parent, root, rel=op.parent_rel)
+        )
+        if not in_scope:
             raise RemoteChanged
         if op.name is not None and any(
             item.id != file_id for item in self._drive.list_children([parent], name=op.name)
@@ -580,14 +663,16 @@ class Executor:
     def _apply(self, run: _Run, work: _Work, file_id: str) -> tuple[RemoteFile, int]:
         op = work.op
         if op.kind in _UPLOAD:
-            return self._upload(op, file_id, run.planned.get(file_id))
+            # A deferred or retried operation may already have created its Drive ID.
+            cache = run.create_folder_cache if not (work.deferrals or work.md5_retries) else None
+            return self._upload(op, file_id, run.planned.get(file_id), cache)
         if op.kind is OpKind.TRASH:
             return self._trash(run, work, file_id), 0
         stop = self._stop.is_set
 
         def check_metadata() -> None:
             self._check_destination(op, file_id)
-            if self._root_id is None or op.kind in _CREATE:
+            if self._root_id is None:
                 return
             previous = run.planned.get(file_id)
             live = self._drive.get(file_id)
@@ -612,12 +697,19 @@ class Executor:
 
         if op.kind is OpKind.MKDIR:
             assert op.parent_id is not None and op.name is not None
+            cache = run.create_folder_cache
+
+            def check_mkdir() -> None:
+                nonlocal cache
+                self._check_destination(op, file_id, cache)
+                cache = None
+
             item = self._drive.create_folder(
                 file_id=file_id,
                 name=op.name,
                 parent_id=op.parent_id,
                 properties=self._properties,
-                before_send=check_metadata,
+                before_send=check_mkdir,
                 should_stop=stop,
             )
         elif op.kind is OpKind.MOVE:
@@ -644,7 +736,9 @@ class Executor:
             )
         return item, 0
 
-    def _upload(self, op: Op, file_id: str, planned: RemoteFile | None) -> tuple[RemoteFile, int]:
+    def _upload(
+        self, op: Op, file_id: str, planned: RemoteFile | None, cache: _CreateFolderCache | None
+    ) -> tuple[RemoteFile, int]:
         def on_bytes(delta: int) -> None:
             try:
                 self._tracker.transfer(op.rel, delta, op.size)
@@ -669,7 +763,11 @@ class Executor:
         )
         try:
             outcome = self._uploader.upload(
-                request, on_bytes=on_bytes, should_stop=self._stop.is_set, root_id=self._root_id
+                request,
+                on_bytes=on_bytes,
+                should_stop=self._stop.is_set,
+                root_id=self._root_id,
+                check_create_parent=cache.check if cache is not None and not update else None,
             )
         except FileNotFoundError as exc:
             raise _LocalReadError(code="local_vanished") from exc
@@ -684,6 +782,9 @@ class Executor:
             return None
 
         code = error.code
+        if isinstance(error, RemoteChanged) and run.create_folder_cache is not None:
+            run.create_folder_cache.clear()
+            run.refresh_requested.set()
         if isinstance(error, FileChanged):
             if op.phase is Phase.CONTENT and work.deferrals + 1 < self._changed_retries:
                 return self._defer(work)

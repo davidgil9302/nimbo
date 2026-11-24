@@ -1240,6 +1240,161 @@ def test_created_ids_capped_at_first_twenty(remote: _Harness) -> None:
     remote.check_mirror()
 
 
+def test_fresh_nested_tree_amortizes_drive_reads(tmp_path: Path) -> None:
+    """Back up a fresh nested tree within the fake Drive read budget."""
+    spec = {f"Docs/a/b/c/file{i:03d}.txt": f"content {i}".encode() for i in range(60)}
+    spec.update({f"Docs/x{j}/f{i}.txt": b"y" * (i + 1) for j in range(4) for i in range(10)})
+    mirror = make_mirror(tmp_path, spec, parallel=4)
+    with mirror.open() as session:
+        start = len(mirror.fake.calls)
+        summary = session.engine.run(trigger="manual")
+        calls = mirror.fake.calls[start:]
+
+    assert summary.result is RunResult.OK
+    assert (summary.uploaded, summary.mkdirs) == (100, 8)
+    writes = sum(call.method in {"POST", "PATCH", "PUT", "DELETE"} for call in calls)
+    reads = len(calls) - writes
+    assert writes == 108
+    assert reads <= summary.uploaded / 2, f"{reads} reads for {summary.uploaded} uploads"
+    mirror.assert_state()
+
+
+def test_busy_content_phase_refreshes_after_operation_budget(remote: _Harness) -> None:
+    """Observe a competing create at the count limit even if the clock stands still."""
+    target = remote.fake.add_folder("Target")
+    indexer = RemoteIndexer(
+        remote.drive, remote.index, target, clock=lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    ops = [remote.upload(rel, parent=target) for rel in ("first", "second", "collision")]
+    run, tracker = remote.persist(ops)
+    indexer.refresh()
+    external = []
+
+    def add_competitor(response: httpx.Response) -> None:
+        if _upload(response.request) and remote.fake.find(target, "second") and not external:
+            external.append(remote.fake.add_file("collision", target, b"external"))
+
+    remote.http.event_hooks["response"].append(add_competitor)
+    report = remote.executor(
+        tracker,
+        root_id=target,
+        refresh_remote=indexer.apply_changes,
+        refresh_ops=2,
+        clock=lambda: 0.0,
+    ).execute(run, ops)
+
+    assert report.done == Counter({OpKind.UPLOAD: 2})
+    assert report.failed == [("collision", "remote_changed")]
+    assert [item.id for item in remote.fake.find(target, "collision")] == external
+
+
+def test_create_rechecks_cached_ancestry_after_expiry(remote: _Harness) -> None:
+    """Recheck a parent that leaves the mirror before its cached proof expires."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.fake.add_folder("nested", target)
+    ops = [remote.upload(f"nested/{rel}", parent=folder) for rel in ("first", "second")]
+    run, tracker = remote.persist(ops)
+    now = 0.0
+
+    def move_after_first(response: httpx.Response) -> None:
+        nonlocal now
+        if _upload(response.request) and now == 0.0:
+            remote.drive.update_metadata(folder, add_parent=outside, remove_parents=[target])
+            now = 61.0
+
+    remote.http.event_hooks["response"].append(move_after_first)
+    report = remote.executor(
+        tracker, root_id=target, refresh_remote=lambda: None, refresh_every=900, clock=lambda: now
+    ).execute(run, ops)
+
+    assert report.done == Counter({OpKind.UPLOAD: 1})
+    assert report.failed == [("nested/second", "remote_changed")]
+    assert not remote.fake.find(folder, "second")
+
+
+def test_create_rechecks_cached_ancestry_after_refresh_reports_drift(remote: _Harness) -> None:
+    """Invalidate the cache even if a refresh observes drift on a different path."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.fake.add_folder("nested", target)
+    ops = [remote.upload(f"nested/{rel}", parent=folder) for rel in ("first", "second")]
+    run, tracker = remote.persist(ops)
+    moved = False
+
+    def refresh() -> None:
+        nonlocal moved
+        if moved or not remote.fake.find(folder, "first"):
+            return
+        remote.fake.add_file("unrelated", target, b"external")
+        remote.index.replace_remote(item for _, item in remote.listing().walk())
+        remote.drive.update_metadata(folder, add_parent=outside, remove_parents=[target])
+        moved = True
+
+    report = remote.executor(
+        tracker, root_id=target, refresh_remote=refresh, refresh_ops=1, clock=lambda: 0.0
+    ).execute(run, ops)
+
+    assert report.done == Counter({OpKind.UPLOAD: 1})
+    assert report.failed == [("nested/second", "remote_changed")]
+    assert not remote.fake.find(folder, "second")
+
+
+def test_remote_changed_refreshes_before_scheduling_the_next_create(remote: _Harness) -> None:
+    """An unrelated failed check clears a warm cache and requests an early refresh."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.fake.add_folder("nested", target)
+    first = remote.upload("nested/first", parent=folder)
+    invalid = remote.upload("invalid", parent=outside)
+    last = remote.upload("nested/last", parent=folder)
+    ops = [first, invalid, last]
+    run, tracker = remote.persist(ops)
+    moved = False
+
+    def refresh() -> None:
+        nonlocal moved
+        if not moved and remote.states(run)[1] == (OpState.FAILED, "remote_changed"):
+            remote.drive.update_metadata(folder, add_parent=outside, remove_parents=[target])
+            moved = True
+
+    report = remote.executor(
+        tracker, root_id=target, refresh_remote=refresh, clock=lambda: 0.0
+    ).execute(run, ops)
+
+    assert report.done == Counter({OpKind.UPLOAD: 1})
+    assert report.failed == [("invalid", "remote_changed"), ("nested/last", "remote_changed")]
+    assert not remote.fake.find(folder, "last")
+
+
+def test_existing_update_rechecks_ancestor_after_cached_create(
+    remote: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A warm creation cache cannot authorize overwriting an existing item."""
+    target = remote.fake.add_folder("Target")
+    outside = remote.fake.add_folder("Outside")
+    folder = remote.fake.add_folder("nested", target)
+    item = remote.fake.add_file("report", folder, b"old")
+    create = remote.upload("nested/first", parent=folder)
+    update = remote.upload("nested/report", b"new", parent=folder, update=item)
+    run, tracker = remote.persist([create, update])
+    original = remote.drive._multipart
+
+    def multipart(**kwargs: Any) -> RemoteFile:
+        if kwargs["update"]:
+            remote.drive.update_metadata(folder, add_parent=outside, remove_parents=[target])
+        return original(**kwargs)
+
+    monkeypatch.setattr(remote.drive, "_multipart", multipart)
+    report = remote.executor(tracker, root_id=target, refresh_remote=lambda: None).execute(
+        run, [create, update]
+    )
+
+    assert report.done == Counter({OpKind.UPLOAD: 1})
+    assert report.failed == [("nested/report", "remote_changed")]
+    assert remote.fake.file(item).content == b"old"
+
+
 @pytest.mark.parametrize("kind", [OpKind.MKDIR, OpKind.UPLOAD, OpKind.MOVE, OpKind.UPDATE])
 def test_refresh_revalidates_pending_write(remote: _Harness, kind: OpKind) -> None:
     root = remote.fake.add_folder("Target")

@@ -117,11 +117,13 @@ class _UploadData:
         source: BinaryIO,
         on_bytes: Callable[[int], None] | None,
         root_id: str | None,
+        check_create_parent: Callable[[str, str | None], bool] | None,
     ) -> None:
         self.req = req
         self.source = source
         self._on_bytes = on_bytes
         self.root_id = root_id
+        self.check_create_parent = check_create_parent
         self._digest = hashlib.md5(usedforsecurity=False)
         self.offset = 0
         self._reported = 0
@@ -205,6 +207,7 @@ class Uploader:
         on_bytes: Callable[[int], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         root_id: str | None = None,
+        check_create_parent: Callable[[str, str | None], bool] | None = None,
     ) -> UploadOutcome:
         """Upload a scanned file, reporting newly confirmed bytes as positive deltas.
 
@@ -214,6 +217,10 @@ class Uploader:
         session. When a root is supplied, RemoteChanged aborts
         transfers that lose live membership. Md5Mismatch indicates unverified
         remote content. Local I/O and typed Drive errors propagate.
+
+        A caller that revalidates names against a refreshed Drive index may
+        supply a parent checker for the first send of a new multipart create.
+        Retries, resumable transfers and updates use the regular live checks.
         """
         try:
             before = req.path.lstat()
@@ -223,7 +230,7 @@ class Uploader:
                 if req.source_root is not None:
                     check_source_scope(source, req.source_root, req.rel)
                 _check_source(req, source, before)
-                data = _UploadData(req, source, on_bytes, root_id)
+                data = _UploadData(req, source, on_bytes, root_id, check_create_parent)
                 item = self._upload_verified(data, should_stop)
                 return UploadOutcome(item, data.md5, data.sent)
         except FileChanged:
@@ -312,6 +319,25 @@ class Uploader:
         req = data.req
         content = data.read(0, req.size)
         data.confirm(req.size, content)
+        check_parent = (
+            data.check_create_parent if data.root_id is not None and not req.update else None
+        )
+
+        def before_send() -> None:
+            nonlocal check_parent
+            if check_parent is None:
+                self._before_write(data)
+                return
+            assert req.parent_id is not None
+            parent_rel = (
+                req.destination_rel.rpartition("/")[0] if req.destination_rel is not None else None
+            )
+            if not check_parent(req.parent_id, parent_rel):
+                raise RemoteChanged(req.rel)
+            self._check_path(data)
+            # A failed send may have created this ID. Revalidate it live on retry.
+            check_parent = None
+
         item = self._drive._multipart(
             data=content,
             file_id=req.file_id,
@@ -321,7 +347,7 @@ class Uploader:
             properties=req.properties,
             update=req.update,
             on_send=data.count_sent,
-            before_send=lambda: self._before_write(data),
+            before_send=before_send,
             should_stop=should_stop,
             validate_recovered=lambda item: self._check_recovered_upload(data, item),
         )
