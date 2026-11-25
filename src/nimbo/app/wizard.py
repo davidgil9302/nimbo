@@ -105,24 +105,21 @@ class InstallOptions:
 
 
 def confirm(t: Translator, console: Console, message: str, *, stream: TextIO | None = None) -> bool:
-    """Ask for a localized yes or no, defaulting to no if input closes."""
-    yes, no = t("cli.answer_yes"), t("cli.answer_no")
-    try:
-        return bool(
-            Prompt.ask(
-                Text(t("cli.confirm_choice", message=message)),
-                console=console,
-                choices=[yes, no],
-                case_sensitive=False,
-                default=no,
-                stream=stream,
-                show_default=False,
-                show_choices=False,
-            )
-            == yes
-        )
-    except EOFError:
-        return False
+    """Ask for a localized yes or no, defaulting to no on empty or closed input."""
+    prompt = Text(t("cli.confirm_choice", message=message)).append(": ")
+    yes = t("cli.answers_yes").split()
+    no = t("cli.answers_no").split()
+    while True:
+        try:
+            answer = console.input(prompt, stream=stream)
+        except EOFError:
+            return False
+        answer = nfc(answer.strip()).casefold()
+        if answer in yes:
+            return True
+        if not answer or answer in no:
+            return False
+        console.print(Text(t("cli.answer_invalid")))
 
 
 def _existing_config(paths: Paths) -> Config | None:
