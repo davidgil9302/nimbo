@@ -37,7 +37,6 @@ from .index import (
 )
 from .lock import RunLock
 from .model import (
-    FOREIGN_ITEM_KEPT,
     INVALID_NAME_PREFIX,
     About,
     AuditReport,
@@ -611,9 +610,7 @@ class Engine:
                 "cancelled": RunResult.CANCELLED,
                 "upload_limit_exceeded": RunResult.PAUSED,
             }.get(report.stop_reason, RunResult.FAILED)
-        elif report.failed or any(
-            issue.code in (FOREIGN_ITEM_KEPT, TRASH_TOOK_NEW_ITEMS) for issue in summary.warnings
-        ):
+        elif report.failed or any(issue.code == TRASH_TOOK_NEW_ITEMS for issue in summary.warnings):
             summary.result = RunResult.PARTIAL
         else:
             summary.result = RunResult.OK
@@ -635,11 +632,6 @@ class Engine:
         pending_files = Counter(planned.per_folder_pending_files)
         pending_bytes = Counter(planned.per_folder_pending_bytes)
         failed_folders = {rel_top(problem.rel) for problem in prepared.scanned.problems}
-        failed_folders.update(
-            rel_top(issue.rel)
-            for issue in prepared.plan.warnings
-            if issue.code == FOREIGN_ITEM_KEPT
-        )
         if summary is not None and summary.run_id is not None:
             for op, state, _ in index.op_states(summary.run_id):
                 folder = rel_top(op.rel)

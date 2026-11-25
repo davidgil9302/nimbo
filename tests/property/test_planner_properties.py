@@ -250,7 +250,7 @@ def test_protected_subtrees_are_untouched(case: Scenario) -> None:
 
 @given(scenarios(), st.integers(min_value=0, max_value=50))
 def test_foreign_owner_preserves_physical_branch(case: Scenario, index: int) -> None:
-    """A foreign tag protects the item and its physical descendants."""
+    """Keep the foreign branch intact while mirroring local paths through eligible parents."""
     in_scope = [
         (rel, item)
         for rel, item in RemoteTree(ROOT, case.remote.values()).walk()
@@ -262,10 +262,32 @@ def test_foreign_owner_preserves_physical_branch(case: Scenario, index: int) -> 
     plan = _plan(case)
     assert PlanIssue("foreign-item-kept", rel) in plan.warnings
     before = RemoteTree(ROOT, case.remote.values())
-    after = RemoteTree(ROOT, _apply(case, plan).values())
+    applied = _apply(case, plan)
+    after = RemoteTree(ROOT, applied.values())
     for protected in (foreign, *before.descendants(foreign.id)):
         assert after.get(protected.id) == protected
         assert after.rel_of(protected.id) == before.rel_of(protected.id)
+
+    desired = {
+        path: entry
+        for path, entry in expected_view(case.local, MATCHER, FOLDERS).items()
+        if not _protected(path, case)
+    }
+    parents = {ROOT}
+    mirrored = set()
+    for path, item in after.walk():
+        entry = desired.get(path)
+        if entry is None or item.parents[0] not in parents or item.is_folder != entry.is_dir:
+            continue
+        if item.protected_from(OWNER) or item.is_google_native:
+            continue
+        if item.is_folder:
+            parents.add(item.id)
+            mirrored.add(path)
+        elif item.owner_root == OWNER and (item.size, item.md5) == (entry.size, case.md5(path)):
+            mirrored.add(path)
+    assert {path for path in desired if is_under(path, rel)} <= mirrored
+    assert _plan(replace(case, remote=applied)).is_empty
 
 
 @given(scenarios())

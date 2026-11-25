@@ -142,6 +142,22 @@ def test_small_file_multipart_create(remote: _Harness) -> None:
     assert remote.fake.calls[-1].query["uploadType"] == "multipart"
 
 
+@pytest.mark.parametrize("data", [b"local copy", _LARGE], ids=["multipart", "resumable"])
+def test_live_create_allows_a_foreign_homonym(remote: _Harness, data: bytes) -> None:
+    req = remote.request(data)
+    assert req.name is not None and req.parent_id is not None
+    foreign = remote.fake.add_file(
+        req.name, req.parent_id, b"other backup", properties={"nimbo": "other"}
+    )
+    preserved = remote.fake.file(foreign)
+
+    outcome = remote.uploader().upload(req, root_id=remote.fake.root_id)
+
+    assert outcome.file.id == req.file_id
+    assert remote.fake.file(req.file_id).content == data
+    assert remote.fake.file(foreign) == preserved
+
+
 def test_small_file_multipart_update_keeps_id(remote: _Harness) -> None:
     """Update one file in place without changing its name or parent."""
     req = remote.request(b"new contents", update=True)

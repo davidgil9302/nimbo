@@ -76,7 +76,6 @@ class _Remote:
         self.parents: dict[str, str] = {}
         self.children: dict[str, set[str]] = defaultdict(set)
         self.eligible: set[str] = set()
-        self.foreign_names: set[tuple[str, str]] = set()
         self.root = tree.root_id
         candidates = set(options.folders)
         protected = set(options.protected)
@@ -96,7 +95,6 @@ class _Remote:
             if foreign or parent in foreign_branches:
                 foreign_branches.add(item.id)
                 if foreign:
-                    self.foreign_names.add((parent, rel))
                     in_scope = not _under_protection(rel, protected) and not matcher.excluded(
                         rel, item.is_folder
                     )
@@ -114,14 +112,13 @@ class _Remote:
                 or _under_protection(rel, protected)
                 or matcher.excluded(rel, item.is_folder)
             ):
-                if rel not in local or local[rel].is_dir != item.is_folder:
+                entry = local.get(rel)
+                if entry is None or entry.is_dir != item.is_folder:
                     plan.warnings.append(PlanIssue("protected-kept", rel))
+                    if entry is not None:
+                        plan.warnings.append(PlanIssue("type-conflict-kept", rel))
             else:
                 self.eligible.add(item.id)
-            if item.id not in self.eligible:
-                entry = local.get(rel)
-                if entry is not None and entry.is_dir != item.is_folder:
-                    plan.warnings.append(PlanIssue("type-conflict-kept", rel))
 
     def descendants(self, file_id: str) -> Iterator[str]:
         pending = list(self.children.get(file_id, ()))
@@ -200,36 +197,24 @@ def _pair(
     md5_of: Callable[[LocalEntry], str | None],
     warnings: list[PlanIssue],
     mapped_id: Callable[[str, set[str]], str | None],
-) -> tuple[dict[str, RemoteFile], dict[str, str], set[str]]:
+) -> tuple[dict[str, RemoteFile], dict[str, str]]:
     # Equal relative paths under different Drive folder IDs are separate branches.
     # Select each parent first, so a chosen child can never ride a trashed duplicate.
+    # Foreign siblings and native files are outside the candidate pool.
     candidates: dict[tuple[str, str], list[RemoteFile]] = defaultdict(list)
     for file_id in sorted(remote.eligible):
         candidates[remote.parents[file_id], remote.rels[file_id]].append(remote.items[file_id])
     pairs: dict[str, RemoteFile] = {}
     dirs = {"": remote.root}
     trash = {}
-    blocked: set[str] = set()
     for file_id in remote.items:
         if file_id in remote.eligible:
             item = remote.items[file_id]
             trash[file_id] = "deleted-locally" if item.owner_root == owner else "extraneous"
     for rel, entry in local.items():
         parent_rel = rel_parent(rel)
-        if parent_rel in blocked:
-            blocked.add(rel)
-            continue
         parent = dirs.get(parent_rel)
         options = candidates.get((parent, rel)) if parent is not None else None
-        if (parent, rel) in remote.foreign_names and not any(
-            item.is_folder == entry.is_dir for item in options or ()
-        ):
-            blocked.add(rel)
-            for item in options or ():
-                trash.pop(item.id, None)
-                for child in remote.descendants(item.id):
-                    trash.pop(child, None)
-            continue
         if not options:
             continue
         keep = _choose(options, entry, owner, md5_of, mapped_id)
@@ -258,7 +243,7 @@ def _pair(
                 trash.pop(dupe.id)
                 for child in remote.descendants(dupe.id):
                     trash.pop(child, None)
-    return pairs, trash, blocked
+    return pairs, trash
 
 
 def _destination_parent(rel: str, pairs: Mapping[str, RemoteFile], root: str) -> str | None:
@@ -645,10 +630,7 @@ def make_plan(
         and remote.items[file_id].owned_by_me is True
         and remote.items[file_id].owner_root == options.root_uuid
     )
-    pairs, trash, blocked = _pair(
-        remote, entries, options.root_uuid, md5_of, plan.warnings, mapped_id
-    )
-    entries = {rel: entry for rel, entry in entries.items() if rel not in blocked}
+    pairs, trash = _pair(remote, entries, options.root_uuid, md5_of, plan.warnings, mapped_id)
     folder_moves, relocated = _folder_moves(remote, entries, pairs, trash, options.root_uuid)
     file_moves = _file_moves(remote, entries, pairs, trash, md5_of, options.root_uuid)
     trashes = _trash_ops(remote, trash, entries, plan.warnings)

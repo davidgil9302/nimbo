@@ -261,12 +261,12 @@ class DriveCase:
             ),
         )
 
-    def create_doc(self, parent_id: str) -> RemoteFile:
+    def create_doc(self, parent_id: str, *, name: str = "native document") -> RemoteFile:
         """Create an empty Google Doc under a verified in-scope parent."""
         return self.drive._metadata_write(
             "POST",
             "/drive/v3/files",
-            {"name": "native document", "mimeType": DOC_MIME, "parents": [parent_id]},
+            {"name": name, "mimeType": DOC_MIME, "parents": [parent_id]},
             before_send=lambda: self._check_item(parent_id, folder=True),
         )
 

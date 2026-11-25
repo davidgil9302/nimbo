@@ -43,9 +43,11 @@ the systemd user service.
 The planner can recognize matching files already in Drive and adopt them
 without re-uploading. It can move matching files and eligible folders
 server-side. It protects excluded paths, Google-native files, shortcuts, and
-items marked as belonging to another mirror. The executor checks subtree
-membership against the index and uses live Drive ancestry checks for
-operations such as trashing and uploading.
+items owned by another account or marked as belonging to another mirror. When
+an unowned or Google-native item shares a local name, nimbo backs up to its own
+file or folder with that name. For folders, nimbo backs up the subtree under
+its own folder ID. The executor checks subtree membership against the index
+and uses live Drive ancestry checks for operations such as trashing and uploading.
 
 Deletes use Drive's trash flag. Undo uses the recorded Drive IDs to untrash
 eligible items and restore missing local data without overwriting existing

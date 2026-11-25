@@ -264,6 +264,32 @@ def test_duplicate_names_keep_the_matching_file(drive_case: DriveCase) -> None:
     assert _assert_mirror(drive_case, ignored={foreign.id})[ANCHOR].id == original.id
 
 
+def test_google_doc_can_share_the_name_of_a_local_folder(drive_case: DriveCase) -> None:
+    """Back up a local subtree beside a Google Doc with the same name."""
+    build_tree(drive_case.config.source.root, {"Projects/nested/report.txt": b"local report"})
+    start_cursor = drive_case.drive.start_page_token()
+    doc = drive_case.create_doc(drive_case.target_id, name="Projects")
+    _wait_for_drive_changes(drive_case, start_cursor, doc)
+
+    summary = drive_case.run()
+
+    assert (summary.mkdirs, summary.uploaded) == (2, 2)
+    items = _assert_mirror(drive_case, ignored={doc.id})
+    backup = items["Projects"]
+    assert backup.is_folder and backup.owner_root is not None
+    assert backup.parents == doc.parents == (drive_case.target_id,)
+    preserved = drive_case.drive.get(doc.id)
+    assert preserved is not None
+    assert _settled_state(preserved) == _settled_state(doc)
+    assert preserved.properties == doc.properties and preserved.owned_by_me == doc.owned_by_me
+
+    traffic = DriveTraffic()
+    drive_case.run(traffic=traffic)
+
+    assert traffic.writes == 0
+    assert _assert_mirror(drive_case, ignored={doc.id})["Projects"].id == backup.id
+
+
 def test_google_doc_protects_locally_deleted_folder(drive_case: DriveCase) -> None:
     """Keep an actual Google Doc and its parent while trashing a deleted binary sibling."""
     root = drive_case.config.source.root

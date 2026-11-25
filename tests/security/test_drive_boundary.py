@@ -55,8 +55,11 @@ def test_newer_editor_duplicate_cannot_replace_backup(tmp_path: Path, folder: bo
         assert not any(
             call.path.rsplit("/", 1)[-1] in protected for call in write_calls(mirror.fake, start)
         )
-        assert result.result is RunResult.PARTIAL
+        assert result.result is RunResult.OK
         assert PlanIssue("foreign-item-kept", "Docs/group" if folder else rel) in result.warnings
+        start = len(mirror.fake.calls)
+        assert session.engine.run(trigger="manual").result is RunResult.OK
+        assert not write_calls(mirror.fake, start)
 
 
 def test_identical_editor_files_are_neither_adopted_nor_moved(tmp_path: Path) -> None:
@@ -91,26 +94,91 @@ def test_identical_editor_files_are_neither_adopted_nor_moved(tmp_path: Path) ->
         assert not any(
             call.path.rsplit("/", 1)[-1] in protected for call in write_calls(mirror.fake, start)
         )
-        assert result.result is RunResult.PARTIAL
+        assert result.result is RunResult.OK
         assert PlanIssue("foreign-item-kept", "Docs/new") in result.warnings
         assert result.adopted == result.moved == 0
+        assert result.uploaded == 2
+        (backup,) = (item for item in mirror.fake.find(docs, "new") if item.id != at_path)
+        assert backup.properties == _OWNER and backup.content == b"same bytes"
         assert any(item.content == b"move candidate" for item in mirror.fake.find(docs, "renamed"))
+        start = len(mirror.fake.calls)
+        second = session.engine.run(trigger="manual")
+        assert second.result is RunResult.OK
+        assert PlanIssue("foreign-item-kept", "Docs/new") in second.warnings
+        assert not write_calls(mirror.fake, start)
+        assert {file_id: mirror.fake.file(file_id) for file_id in protected} == protected
 
 
-def test_foreign_mirror_subtree_is_kept_while_other_paths_sync(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["folder", "document"])
+def test_local_subtree_syncs_alongside_an_untouchable_item(tmp_path: Path, kind: str) -> None:
     mirror = make_mirror(tmp_path, {"Docs/new": b"mirrored", "Docs/foreign/report": b"local"})
     docs = mirror.fake.add_folder("Docs", mirror.target)
-    foreign = mirror.fake.add_folder("foreign", docs, properties={OWNER_PROPERTY: "another-root"})
-    child = mirror.fake.add_file("report", foreign, b"other backup", properties=_OWNER)
-    protected = {file_id: mirror.fake.file(file_id) for file_id in (foreign, child)}
+    if kind == "folder":
+        foreign = mirror.fake.add_folder(
+            "foreign", docs, properties={OWNER_PROPERTY: "another-root"}
+        )
+        child = mirror.fake.add_file("report", foreign, b"other backup", properties=_OWNER)
+        protected_ids = (foreign, child)
+        notice = "foreign-item-kept"
+    else:
+        foreign = mirror.fake.add_native("foreign", docs)
+        protected_ids = (foreign,)
+        notice = "google-native-kept"
+    protected = {file_id: mirror.fake.file(file_id) for file_id in protected_ids}
 
     with mirror.open() as session:
         result = session.engine.run(trigger="manual")
+        assert result.result is RunResult.OK
+        assert PlanIssue(notice, "Docs/foreign") in result.warnings
+        assert session.index.folder_stats()["Docs"].last_ok == result.finished_at
+        assert mirror.fake.find(docs, "new")[0].content == b"mirrored"
+        (backup,) = (item for item in mirror.fake.find(docs, "foreign") if item.id != foreign)
+        assert backup.is_folder and backup.properties == _OWNER
+        (report,) = mirror.fake.find(backup.id, "report")
+        assert report.content == b"local"
+        assert {file_id: mirror.fake.file(file_id) for file_id in protected} == protected
 
-    assert result.result is RunResult.PARTIAL
-    assert PlanIssue("foreign-item-kept", "Docs/foreign") in result.warnings
-    assert mirror.fake.find(docs, "new")[0].content == b"mirrored"
+    start = len(mirror.fake.calls)
+    with mirror.open() as session:
+        second = session.engine.run(trigger="manual")
+    assert second.result is RunResult.OK
+    assert PlanIssue(notice, "Docs/foreign") in second.warnings
+    assert not write_calls(mirror.fake, start)
     assert {file_id: mirror.fake.file(file_id) for file_id in protected} == protected
+
+
+@pytest.mark.parametrize("local_dir", [False, True], ids=["local-file", "local-folder"])
+def test_local_type_change_with_foreign_homonym(tmp_path: Path, local_dir: bool) -> None:
+    rel = "Docs/shared"
+    local_file = f"{rel}/report" if local_dir else rel
+    mirror = make_mirror(tmp_path, {local_file: b"local"})
+    docs = mirror.fake.add_folder("Docs", mirror.target)
+    if local_dir:
+        obsolete = mirror.fake.add_file("shared", docs, b"old file", properties=_OWNER)
+        foreign = mirror.fake.add_folder(
+            "shared", docs, properties={OWNER_PROPERTY: "another-root"}
+        )
+    else:
+        obsolete = mirror.fake.add_folder("shared", docs, properties=_OWNER)
+        foreign = mirror.fake.add_file("shared", docs, b"editor's bytes", owned_by_me=False)
+    preserved = mirror.fake.file(foreign)
+
+    with mirror.open() as session:
+        result = session.engine.run(trigger="manual")
+        assert result.result is RunResult.OK
+        assert result.trashed == 1 and result.uploaded == 1
+        assert PlanIssue("foreign-item-kept", rel) in result.warnings
+        assert mirror.fake.file(obsolete).trashed
+        (backup,) = (
+            item for item in mirror.fake.find(docs, "shared") if item.id not in {obsolete, foreign}
+        )
+        assert backup.properties == _OWNER and backup.is_folder == local_dir
+        (payload,) = mirror.fake.find(backup.id, "report") if local_dir else (backup,)
+        assert payload.content == b"local"
+        start = len(mirror.fake.calls)
+        assert session.engine.run(trigger="manual").result is RunResult.OK
+        assert not write_calls(mirror.fake, start)
+    assert mirror.fake.file(foreign) == preserved
 
 
 def test_editor_duplicates_cannot_dilute_deletion_ratio(tmp_path: Path) -> None:

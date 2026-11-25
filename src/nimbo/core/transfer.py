@@ -16,7 +16,7 @@ from typing import BinaryIO, Protocol
 from .drive import DriveClient
 from .errors import Conflict, FileChanged, Md5Mismatch, RemoteChanged, SessionExpired, Stopped
 from .hasher import check_source_path
-from .model import PART_SUFFIX, RemoteFile, drive_ms, nfc
+from .model import OWNER_PROPERTY, PART_SUFFIX, RemoteFile, drive_ms, nfc
 from .tree import _rel_component
 
 _BLOCK = 256 << 10
@@ -29,7 +29,11 @@ def create_session_kind(parent_id: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class UploadRequest:
-    """Describe a scanned file, its canonical source root and its Drive destination."""
+    """Describe a scanned file, its canonical source root and its Drive destination.
+
+    The optional known_type_conflict callback accepts an opposite-kind sibling
+    that has been verified against the plan.
+    """
 
     rel: str
     path: Path
@@ -43,6 +47,7 @@ class UploadRequest:
     source_root: Path | None = None
     destination_rel: str | None = None
     expected_remote: RemoteFile | None = None
+    known_type_conflict: Callable[[RemoteFile], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,8 +430,12 @@ class Uploader:
             raise RemoteChanged(req.rel)
         if data.root_id is not None and not req.update:
             assert req.parent_id is not None and req.name is not None
+            root_uuid = req.properties.get(OWNER_PROPERTY)
             if any(
                 child.id != req.file_id
+                and not child.is_google_native
+                and (root_uuid is None or not child.protected_from(root_uuid))
+                and (req.known_type_conflict is None or not req.known_type_conflict(child))
                 for child in self._drive.list_children([req.parent_id], name=req.name)
             ):
                 raise RemoteChanged(req.rel)

@@ -311,20 +311,74 @@ def test_type_conflict_with_unmanaged_protected_folder_keeps_cleaning_eligible_c
     assert PlanIssue("type-conflict-kept", "Projects/a") in plan.warnings
 
 
-def test_local_dir_can_be_mirrored_alongside_a_native_file() -> None:
-    """An untouchable Drive shortcut at the local directory's path can remain alongside it."""
-    local = {entry.rel: entry for entry in (LOCAL_TOP, _entry("a", size=-1), _entry("a/x"))}
-    native = _remote("n", "a", mime="application/vnd.google-apps.shortcut", owner=None)
-    files = {item.id: item for item in (TOP, native)}
-    plan = _plan(local.values(), [native])
-    assert _ops(plan) == [(OpKind.MKDIR, "Projects/a", None), (OpKind.UPLOAD, "Projects/a/x", None)]
-    assert PlanIssue("type-conflict-kept", "Projects/a") in plan.warnings
+@pytest.mark.parametrize(
+    ("local_dir", "remote_mime", "owner", "owned_by_me", "notice"),
+    [
+        (False, "text/plain", OWNER, False, "foreign-item-kept"),
+        (True, FOLDER_MIME, "another-mirror", True, "foreign-item-kept"),
+        (True, "application/vnd.google-apps.document", "another-mirror", True, "foreign-item-kept"),
+        (True, "application/vnd.google-apps.shortcut", None, True, "google-native-kept"),
+        (False, FOLDER_MIME, OWNER, False, "foreign-item-kept"),
+        (True, "text/plain", "another-mirror", True, "foreign-item-kept"),
+    ],
+    ids=["files", "folders", "document", "shortcut", "file-over-folder", "folder-over-file"],
+)
+def test_local_item_is_mirrored_alongside_protected_homonym(
+    local_dir: bool, remote_mime: str, owner: str | None, owned_by_me: bool, notice: str
+) -> None:
+    """Keep the protected ID and back up the local path under a separate ID."""
+    rel = "Projects/a"
+    foreign = _remote(
+        "a-foreign",
+        "a",
+        mime=remote_mime,
+        size=-1 if remote_mime == FOLDER_MIME else 3,
+        ms=20,
+        md5="different",
+        owner=owner,
+        owned_by_me=owned_by_me,
+    )
+    preserved = {foreign.id: foreign}
+    if foreign.is_folder:
+        # Even a child with this mirror's marker is protected inside the foreign branch.
+        child = _remote("foreign-child", "x", foreign.id, md5="different")
+        preserved[child.id] = child
+    entries = [_entry("a", size=-1), _entry("a/x")] if local_dir else [_entry("a")]
+    expected = (
+        [(OpKind.MKDIR, rel, None), (OpKind.UPLOAD, f"{rel}/x", None)]
+        if local_dir
+        else [(OpKind.UPLOAD, rel, None)]
+    )
+    local = {entry.rel: entry for entry in (LOCAL_TOP, *entries)}
 
-    after = apply_plan(files, plan, local, lambda rel: "same", ROOT, OWNER)
-    assert after[native.id] == native
-    second = _plan(local.values(), after.values(), top=False, deep=True)
-    assert not second.errors
-    assert second.is_empty
+    plan = _plan(entries, preserved.values(), deep=True)
+
+    assert not plan.errors
+    assert _ops(plan) == expected
+    assert plan.warnings == [PlanIssue(notice, rel)]
+    assert [op.parent_rel for op in plan.ops] == ([FOLDER, rel] if local_dir else [FOLDER])
+    after = apply_plan({TOP.id: TOP, **preserved}, plan, local, lambda rel: "same", ROOT, OWNER)
+    assert {file_id: after[file_id] for file_id in preserved} == preserved
+    (backup,) = (
+        item for item in after.values() if item.name == foreign.name and item.id != foreign.id
+    )
+    assert backup.parents == foreign.parents and backup.owner_root == OWNER
+    if local_dir:
+        (backed_up_child,) = (item for item in after.values() if item.parents == (backup.id,))
+        assert backed_up_child.name == "x" and backed_up_child.md5 == "same"
+    else:
+        assert backup.md5 == "same"
+
+    for listing in (list(after.values()), list(reversed(after.values()))):
+        second = _plan(entries, listing, top=False, deep=True)
+        assert not second.errors
+        assert second.is_empty
+        assert second.warnings == plan.warnings
+        if local_dir:
+            assert second.folder_ids[rel] == backup.id
+
+    deleted = _plan([], after.values(), top=False)
+    assert _ops(deleted) == [(OpKind.TRASH, rel, backup.id)]
 
 
 def test_file_rename_is_move_not_upload():

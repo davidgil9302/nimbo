@@ -343,6 +343,14 @@ def _same_item(planned: RemoteFile, current: RemoteFile | None) -> bool:
     return current == planned
 
 
+def _planned_type_conflict(tree: RemoteTree, op: Op, item: RemoteFile) -> bool:
+    # The replacement is created before any trash. A new collision requires replanning.
+    if op.kind not in _CREATE or item.is_folder == (op.kind is OpKind.MKDIR):
+        return False
+    planned = tree.get(item.id)
+    return planned is not None and _same_item(planned, item)
+
+
 def _inherited_trash_children(
     drive: DriveClient, parents: Sequence[str], should_stop: Callable[[], bool]
 ) -> Iterator[RemoteFile]:
@@ -761,13 +769,14 @@ class Executor:
                         and not current.trashed
                         and parent in current.parents
                         and _rel_component(current.name) == op.name
+                        and not current.is_google_native
+                        and not current.protected_from(self._root_uuid)
+                        and not _planned_type_conflict(run.planned, op, current)
                     ):
-                        if current.protected_from(self._root_uuid):
-                            raise ForeignItemKept
                         raise RemoteChanged
 
     def _check_destination(
-        self, op: Op, file_id: str, cache: _CreateFolderCache | None = None
+        self, run: _Run, op: Op, file_id: str, cache: _CreateFolderCache | None = None
     ) -> None:
         parent = op.parent_id
         root = self._root_id
@@ -783,8 +792,13 @@ class Executor:
         if op.name is not None:
             for item in self._drive.list_children([parent], name=op.name):
                 if item.protected_from(self._root_uuid):
-                    raise ForeignItemKept
-                if item.id != file_id:
+                    if item.id == file_id:
+                        raise ForeignItemKept
+                elif (
+                    item.id != file_id
+                    and not item.is_google_native
+                    and not _planned_type_conflict(run.planned, op, item)
+                ):
                     raise RemoteChanged
 
     def _check_live_parent(self, item: RemoteFile, rel: str | None) -> None:
@@ -948,13 +962,13 @@ class Executor:
         if op.kind in _UPLOAD:
             # A deferred or retried operation may already have created its Drive ID.
             cache = run.create_folder_cache if not (work.deferrals or work.md5_retries) else None
-            return self._upload(op, file_id, run.planned.get(file_id), cache)
+            return self._upload(run, op, file_id, cache)
         if op.kind is OpKind.TRASH:
             return self._trash(run, work, file_id), 0, None
         stop = self._stop.is_set
 
         def check_metadata() -> None:
-            self._check_destination(op, file_id)
+            self._check_destination(run, op, file_id)
             live = self._drive.get(file_id)
             source = op.src_rel if op.kind is OpKind.MOVE else op.rel
             if live is not None and live.protected_from(self._root_uuid):
@@ -990,7 +1004,7 @@ class Executor:
 
             def check_mkdir() -> None:
                 nonlocal cache
-                self._check_destination(op, file_id, cache)
+                self._check_destination(run, op, file_id, cache)
                 cache = None
 
             item = self._drive.create_folder(
@@ -1038,7 +1052,7 @@ class Executor:
         return item, 0, op.md5 if adopted else None
 
     def _upload(
-        self, op: Op, file_id: str, planned: RemoteFile | None, cache: _CreateFolderCache | None
+        self, run: _Run, op: Op, file_id: str, cache: _CreateFolderCache | None
     ) -> tuple[RemoteFile, int, str]:
         def on_bytes(delta: int) -> None:
             try:
@@ -1060,7 +1074,8 @@ class Executor:
             properties=self._properties,
             source_root=self._real_source_root,
             destination_rel=op.rel,
-            expected_remote=planned if update else None,
+            expected_remote=run.planned.get(file_id) if update else None,
+            known_type_conflict=lambda item: _planned_type_conflict(run.planned, op, item),
         )
         try:
             if self._root_id is None and update:
