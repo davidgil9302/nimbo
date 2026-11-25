@@ -88,7 +88,11 @@ class _Parser(argparse.ArgumentParser):
 
     def format_help(self) -> str:
         """Localize the usage line and option headings in argparse's help."""
-        return self._localize(super().format_help())
+        text = super().format_help()
+        if self._t.language == "en":
+            # Older argparse versions repeat the metavar after each alias.
+            text = text.replace("--lang {es,en}, --idioma", "--lang, --idioma", 1)
+        return self._localize(text)
 
     def format_usage(self) -> str:
         """Return the localized usage line."""
@@ -107,20 +111,22 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog} · {self._t('cli.parser.invalid', prog=self.prog)}\n")
 
 
+def _localized_names(t: Translator, es: str, en: str) -> tuple[str, str]:
+    return (en, es) if t.language == "en" else (es, en)
+
+
 def _global_options(parser: argparse.ArgumentParser, t: Translator, *, subcommand: bool) -> None:
     default = argparse.SUPPRESS if subcommand else None
     help_for = (lambda _: argparse.SUPPRESS) if subcommand else t
     parser.add_argument(
-        "--sin-animaciones",
-        "--no-motion",
+        *_localized_names(t, "--sin-animaciones", "--no-motion"),
         dest="reduced_motion",
         action="store_true",
         default=default,
         help=help_for("cli.option.no_motion"),
     )
     parser.add_argument(
-        "--idioma",
-        "--lang",
+        *_localized_names(t, "--idioma", "--lang"),
         dest="language",
         choices=("es", "en"),
         default=default,
@@ -178,9 +184,10 @@ def build_parser(t: Translator) -> argparse.ArgumentParser:
     sub = {}
     for es, en in _COMMANDS:
         help_text = t(f"cli.command_help.{en}")
+        primary, alias = _localized_names(t, es, en)
         sub[en] = commands.add_parser(
-            es,
-            aliases=[en],
+            primary,
+            aliases=[alias],
             translator=t,
             help=help_text,
             description=help_text,
@@ -191,18 +198,23 @@ def build_parser(t: Translator) -> argparse.ArgumentParser:
     parser.set_defaults(command=None)
     now = sub["now"]
     now.add_argument(
-        "--aqui", "--here", dest="here", action="store_true", help=t("cli.option.here")
+        *_localized_names(t, "--aqui", "--here"),
+        dest="here",
+        action="store_true",
+        help=t("cli.option.here"),
     )
     now.add_argument(
-        "--confirmar",
-        "--confirm",
+        *_localized_names(t, "--confirmar", "--confirm"),
         dest="confirm",
         action="store_true",
         help=t("cli.option.confirm"),
     )
     for name in ("now", "install", "uninstall"):
         sub[name].add_argument(
-            "--si", "--yes", dest="yes", action="store_true", help=t("cli.option.yes")
+            *_localized_names(t, "--si", "--yes"),
+            dest="yes",
+            action="store_true",
+            help=t("cli.option.yes"),
         )
     for name in ("status", "pending", "history"):
         sub[name].add_argument("--json", action="store_true", help=t("cli.option.json"))
@@ -219,7 +231,10 @@ def build_parser(t: Translator) -> argparse.ArgumentParser:
         "run_id", nargs="?", type=_run_id, metavar=t("cli.metavar.run"), help=t("cli.option.run_id")
     )
     sub["verify"].add_argument(
-        "--reparar", "--repair", dest="repair", action="store_true", help=t("cli.option.repair")
+        *_localized_names(t, "--reparar", "--repair"),
+        dest="repair",
+        action="store_true",
+        help=t("cli.option.repair"),
     )
     sub["run"].add_argument("--auto", action="store_true", help=t("cli.option.auto"))
     _client_options(sub["install"], t)
@@ -234,24 +249,28 @@ def build_parser(t: Translator) -> argparse.ArgumentParser:
     install.add_argument("--target", metavar=t("cli.metavar.target"), help=t("cli.option.target"))
     install.add_argument("--at", metavar=t("cli.metavar.time"), help=t("cli.option.at"))
     install.add_argument(
-        "--no-interactivo",
-        "--non-interactive",
+        *_localized_names(t, "--no-interactivo", "--non-interactive"),
         dest="unattended",
         action="store_true",
         help=t("cli.option.unattended"),
     )
     install.add_argument(
-        "--sin-servicio",
-        "--no-service",
+        *_localized_names(t, "--sin-servicio", "--no-service"),
         dest="no_service",
         action="store_true",
         help=t("cli.option.no_service"),
     )
     sub["uninstall"].add_argument(
-        "--borrar-datos", "--purge", dest="purge", action="store_true", help=t("cli.option.purge")
+        *_localized_names(t, "--borrar-datos", "--purge"),
+        dest="purge",
+        action="store_true",
+        help=t("cli.option.purge"),
     )
     sub["uninstall"].add_argument(
-        "--revocar", "--revoke", dest="revoke", action="store_true", help=t("cli.option.revoke")
+        *_localized_names(t, "--revocar", "--revoke"),
+        dest="revoke",
+        action="store_true",
+        help=t("cli.option.revoke"),
     )
     return parser
 

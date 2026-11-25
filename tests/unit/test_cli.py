@@ -46,29 +46,54 @@ from nimbo.core.secrets import REFRESH_TOKEN_KEY, MemorySecretStore
 from tests.fakedrive import FakeDrive
 
 
-@pytest.mark.parametrize(
-    ("spanish", "english", "flags"),
-    [
-        ("ahora", "now", ["--aqui", "--confirmar", "--si"]),
-        ("pendientes", "pending", ["--json"]),
-        ("estado", "status", ["--json"]),
-        ("historial", "history", ["--json", "--n", "2"]),
-        ("deshacer", "undo", ["1"]),
-        ("verificar", "verify", ["--reparar"]),
-        ("detener", "stop", []),
-        ("instalar", "install", ["--no-interactivo", "--sin-servicio", "--at", "12:15"]),
-        ("conectar", "connect", ["--client-json", "file.json"]),
-        ("desinstalar", "uninstall", ["--borrar-datos", "--si"]),
-        ("diagnostico", "doctor", []),
-        ("registro", "log", ["--n", "3"]),
-        ("ejecutar", "run", ["--auto"]),
-    ],
-)
-def test_parse_all_commands_and_aliases(spanish, english, flags):
-    parser = cli.build_parser(Translator("en"))
+@pytest.mark.parametrize("language", ["es", "en"])
+@pytest.mark.parametrize(("spanish", "english"), cli._COMMANDS)
+def test_parse_all_commands_and_aliases(language, spanish, english):
+    parser = cli.build_parser(Translator(language))
+    assert parser.parse_args([spanish]).command == parser.parse_args([english]).command == english
+    flags = {
+        "now": ["--aqui", "--confirmar", "--si"],
+        "pending": ["--json"],
+        "status": ["--json"],
+        "history": ["--json", "--n", "2"],
+        "undo": ["1"],
+        "verify": ["--reparar"],
+        "install": ["--no-interactivo", "--sin-servicio", "--at", "12:15"],
+        "connect": ["--client-json", "file.json"],
+        "uninstall": ["--borrar-datos", "--si"],
+        "log": ["--n", "3"],
+        "run": ["--auto"],
+    }.get(english, [])
     selected = parser.parse_args([spanish, *flags])
     assert selected.command == english
     assert vars(selected) == vars(parser.parse_args([english, *flags]))
+
+
+@pytest.mark.parametrize("language", ["es", "en"])
+@pytest.mark.parametrize(
+    ("prefix", "spanish", "english", "dest", "expected"),
+    [
+        ([], ["--sin-animaciones"], ["--no-motion"], "reduced_motion", True),
+        ([], ["--idioma", "en"], ["--lang", "en"], "language", "en"),
+        (["now"], ["--sin-animaciones"], ["--no-motion"], "reduced_motion", True),
+        (["now"], ["--idioma", "es"], ["--lang", "es"], "language", "es"),
+        (["now"], ["--aqui"], ["--here"], "here", True),
+        (["now"], ["--confirmar"], ["--confirm"], "confirm", True),
+        (["now"], ["--si"], ["--yes"], "yes", True),
+        (["verify"], ["--reparar"], ["--repair"], "repair", True),
+        (["install"], ["--si"], ["--yes"], "yes", True),
+        (["install"], ["--no-interactivo"], ["--non-interactive"], "unattended", True),
+        (["install"], ["--sin-servicio"], ["--no-service"], "no_service", True),
+        (["uninstall"], ["--si"], ["--yes"], "yes", True),
+        (["uninstall"], ["--borrar-datos"], ["--purge"], "purge", True),
+        (["uninstall"], ["--revocar"], ["--revoke"], "revoke", True),
+    ],
+)
+def test_parse_bilingual_options(language, prefix, spanish, english, dest, expected):
+    parser = cli.build_parser(Translator(language))
+    selected = parser.parse_args([*prefix, *spanish])
+    assert getattr(selected, dest) == expected
+    assert vars(selected) == vars(parser.parse_args([*prefix, *english]))
 
 
 @pytest.mark.parametrize(
@@ -156,6 +181,41 @@ def test_language_flag(capsys):
     assert "usage:" in capsys.readouterr().err.lower()
 
 
+@pytest.mark.parametrize(
+    ("language", "help_options", "usage_options"),
+    [
+        (
+            "en",
+            ("--no-motion, --sin-animaciones", "--lang, --idioma"),
+            "[--no-motion] [--lang {es,en}]",
+        ),
+        (
+            "es",
+            ("--sin-animaciones, --no-motion",),
+            "[--sin-animaciones] [--idioma {es,en}]",
+        ),
+    ],
+)
+def test_top_level_help_option_order(language, help_options, usage_options):
+    parser = cli.build_parser(Translator(language))
+    output = parser.format_help()
+    assert all(option in output for option in help_options)
+    assert usage_options in parser.format_usage()
+
+
+@pytest.mark.parametrize(
+    ("command", "options"),
+    [
+        ("now", ("--here, --aqui", "--yes, --si")),
+        ("install", ("--non-interactive, --no-interactivo",)),
+    ],
+)
+def test_english_subcommand_help_prefers_english_options(command, options, capsys):
+    assert cli.main(["--lang", "en", command, "--help"]) == 0
+    output = capsys.readouterr().out
+    assert all(option in output for option in options)
+
+
 @pytest.mark.parametrize("language", ["es", "en"])
 def test_every_help_is_localized(language, capsys):
     t = Translator(language)
@@ -166,11 +226,12 @@ def test_every_help_is_localized(language, capsys):
     assert all(flag in top for flag in ("--version", "-v", "--no-motion", "--lang"))
     for spanish, english in cli._COMMANDS:
         description = t(f"cli.command_help.{english}")
-        assert f"{spanish} ({english})" in top
+        primary, secondary = (english, spanish) if language == "en" else (spanish, english)
+        assert f"{primary} ({secondary})" in top
         for alias in (spanish, english):
             assert cli.main([alias, "--idioma", language, "--help"]) == 0
             output = capsys.readouterr()
-            assert output.out.startswith(t("cli.parser.usage"))
+            assert output.out.startswith(f"{t('cli.parser.usage')} backup {primary} ")
             assert t("cli.parser.options") in output.out and not output.err
             assert description in " ".join(output.out.split())
             assert "cli." not in output.out
