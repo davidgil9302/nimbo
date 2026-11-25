@@ -18,12 +18,13 @@ Use Linux with Python 3.11 or newer and an unlocked Secret Service keyring
 (such as GNOME Keyring or a compatible KWallet setup). For scheduled backups, use
 a session with a running systemd user manager.
 
-Install with either pipx or uv.
+Install from this repository with either pipx or uv. The `nimbo` package on
+PyPI is an unrelated project, so do not install it by name.
 
 ```sh
-pipx install nimbo
+pipx install git+https://github.com/davidgil9302/nimbo.git
 # Or
-uv tool install nimbo
+uv tool install git+https://github.com/davidgil9302/nimbo.git
 ```
 
 Follow the [OAuth desktop client guide](docs/oauth-client.md) to create your own

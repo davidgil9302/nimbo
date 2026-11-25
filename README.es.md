@@ -20,12 +20,13 @@ Service que esté desbloqueado (por ejemplo, GNOME Keyring o una configuración
 compatible de KWallet). Para programar respaldos, necesitas una sesión con el
 gestor de usuario de systemd activo.
 
-Instala con pipx o uv.
+Instala desde este repositorio con pipx o uv. El paquete `nimbo` de PyPI es otro
+proyecto sin relación, así que no lo instales por nombre.
 
 ```sh
-pipx install nimbo
+pipx install git+https://github.com/davidgil9302/nimbo.git
 # O bien
-uv tool install nimbo
+uv tool install git+https://github.com/davidgil9302/nimbo.git
 ```
 
 Sigue la [guía del cliente OAuth de escritorio](docs/oauth-client.es.md) para
