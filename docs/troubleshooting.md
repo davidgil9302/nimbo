@@ -23,7 +23,7 @@ checks.
 | Daily upload limit reached | Uploads pause and pending files can continue in a later run when Google allows uploads again. |
 | The engine reports that a run is already active | Check `backup estado`. Use `backup detener` for a service run or Ctrl+C in the terminal running a foreground backup. |
 | The mirror differs from the source | Run `backup verificar` to inspect differences. Use `backup verificar --reparar` to run the normal repair plan with safety checks. |
-| An edit kept the file's size and modification time | A routine backup can reuse the cached hash and miss the edit. Run `backup verificar` to compare the contents with Drive. Use `backup verificar --reparar` to copy the changed contents. |
+| A backup reads many files after remounting the source | FAT, exFAT and some network filesystems can assign different inode numbers on each mount. Nimbo re-reads affected files to compare checksums and uploads only changed contents. |
 | A high percentage of files in a small folder was deleted without confirmation | The ratio brake applies only when the folder has at least `safety.ratio_min_files` planned file deletions. The default is 20, so folders with fewer files are exempt from the ratio brake. The separate `safety.max_deletes` limit still applies. |
 
 For more detail, run `backup historial` and `backup registro --n 40`. The latter

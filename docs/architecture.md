@@ -20,9 +20,11 @@ the systemd user service.
    The index and changes cursor advance together. The indexer can fall back
    to a full listing when the cursor is stale or the feed proves unreliable.
 3. **Scan and plan.** The scanner walks active folders, normalizes relative
-   names to Unicode NFC, and records paths that need protection. A local hash
-   cache helps avoid repeat reads. The planner consumes the local scan and
-   indexed Drive tree without performing Drive writes.
+   names to Unicode NFC, and records paths that need protection. For files it
+   records the inode and inode change time (`ctime`) alongside size and mtime.
+   The planner uses the last recorded identity and Drive checksum to check for
+   replacements and decides which files to rehash. The local hash cache also
+   includes the inode and ctime in its lookup. Planning performs no Drive writes.
 4. **Apply preflight limits.** The engine checks deletion brakes and
    available Drive storage before applying the plan. A brake approval is
    single-use, expires after 24 hours, and matches a fingerprint of the
@@ -58,8 +60,8 @@ listing. Optional repair uses the usual backup planner and safety checks.
 
 SQLite runs in WAL mode with full synchronization for writable connections.
 The database holds remote entries and the changes cursor, cached local hashes,
-run and operation records, resumable upload sessions, trash records, and
-per-folder statistics. The engine also publishes progress through
+local file identities, run and operation records, resumable upload sessions,
+trash records, and per-folder statistics. The engine also publishes progress through
 `progress.json` and records structured local logs.
 
 The dashboard reads the index in read-only mode for status and reads

@@ -16,7 +16,7 @@ from typing import BinaryIO, Protocol
 from .drive import DriveClient
 from .errors import Conflict, FileChanged, Md5Mismatch, RemoteChanged, SessionExpired, Stopped
 from .hasher import check_source_path
-from .model import OWNER_PROPERTY, PART_SUFFIX, RemoteFile, drive_ms, nfc
+from .model import OWNER_PROPERTY, PART_SUFFIX, FileIdentity, RemoteFile, drive_ms, nfc
 from .tree import _rel_component
 
 _BLOCK = 256 << 10
@@ -48,6 +48,7 @@ class UploadRequest:
     destination_rel: str | None = None
     expected_remote: RemoteFile | None = None
     known_type_conflict: Callable[[RemoteFile], bool] | None = None
+    identity: FileIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +88,10 @@ def _session_kind(req: UploadRequest) -> str:
 
 
 def _check_stat(req: UploadRequest, info: os.stat_result) -> None:
-    if not stat.S_ISREG(info.st_mode) or (info.st_size, info.st_mtime_ns) != (
-        req.size,
-        req.mtime_ns,
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or (info.st_size, info.st_mtime_ns) != (req.size, req.mtime_ns)
+        or (req.identity is not None and req.identity != (info.st_ino, info.st_ctime_ns))
     ):
         raise FileChanged(req.rel)
 
@@ -606,8 +608,8 @@ class Downloader:
 
     def download(
         self, file: RemoteFile, dest: Path, *, on_bytes: Callable[[int], None] | None = None
-    ) -> None:
-        """Restore a file, preserving mtime and reporting streamed byte deltas.
+    ) -> os.stat_result:
+        """Restore a file, preserving mtime, and return its published local metadata.
 
         Raise FileExistsError if the destination is occupied, including by a
         concurrent writer, and Md5Mismatch for a size or checksum mismatch.
@@ -622,29 +624,31 @@ class Downloader:
             fd, part_name = tempfile.mkstemp(dir=f"/proc/self/fd/{parent_fd}", suffix=PART_SUFFIX)
             part = Path(part_name)
             try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w+b", closefd=False) as sink:
-                    self._drive.download(file.id, sink, on_bytes=on_bytes)
-                    size = sink.tell()
-                    sink.seek(0)
-                    digest = hashlib.file_digest(
-                        sink, lambda: hashlib.md5(usedforsecurity=False)
-                    ).hexdigest()
-                    if (size, digest) != (file.size, file.md5):
-                        raise Md5Mismatch(file.name)
-                if file.modified_ms is not None:
-                    ns = file.modified_ms * 1_000_000
-                    os.utime(fd, ns=(ns, ns))
-                # linkat follows the procfs descriptor link to the verified inode.
-                os.link(
-                    f"/proc/self/fd/{fd}", dest.name, dst_dir_fd=parent_fd, follow_symlinks=True
-                )
-            finally:
                 try:
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, "w+b", closefd=False) as sink:
+                        self._drive.download(file.id, sink, on_bytes=on_bytes)
+                        size = sink.tell()
+                        sink.seek(0)
+                        digest = hashlib.file_digest(
+                            sink, lambda: hashlib.md5(usedforsecurity=False)
+                        ).hexdigest()
+                        if (size, digest) != (file.size, file.md5):
+                            raise Md5Mismatch(file.name)
+                    if file.modified_ms is not None:
+                        ns = file.modified_ms * 1_000_000
+                        os.utime(fd, ns=(ns, ns))
+                    # linkat follows the procfs descriptor link to the verified inode.
+                    os.link(
+                        f"/proc/self/fd/{fd}", dest.name, dst_dir_fd=parent_fd, follow_symlinks=True
+                    )
+                finally:
                     with suppress(FileNotFoundError):
                         if os.path.samestat(part.lstat(), os.fstat(fd)):
                             part.unlink()
-                finally:
-                    os.close(fd)
+                # Removing the staging link changes the inode's ctime.
+                return os.fstat(fd)
+            finally:
+                os.close(fd)
         finally:
             os.close(parent_fd)

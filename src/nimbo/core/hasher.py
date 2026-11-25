@@ -10,19 +10,23 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from nimbo.core.errors import FileChanged, Stopped
-from nimbo.core.model import LocalEntry
+from nimbo.core.model import FileIdentity, LocalEntry
 
 _CHUNK_SIZE = 4 << 20
 
 
 class HashCache(Protocol):
-    """Cache a file digest by its NFC relative path, size and nanosecond mtime."""
+    """Cache a digest by path, size, nanosecond mtime and local file identity."""
 
-    def get_hash(self, rel: str, size: int, mtime_ns: int) -> str | None:
-        """Return the cached digest for the exact metadata, or None on a miss."""
+    def get_hash(
+        self, rel: str, size: int, mtime_ns: int, *, identity: FileIdentity | None = None
+    ) -> str | None:
+        """Return the cached digest for matching metadata, or None on a miss."""
         ...
 
-    def put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
+    def put_hash(
+        self, rel: str, size: int, mtime_ns: int, md5: str, *, identity: FileIdentity | None = None
+    ) -> None:
         """Store the digest for the given path and metadata."""
         ...
 
@@ -68,9 +72,10 @@ def _open_regular_candidate(path: str, flags: int) -> int:
 
 
 def _matches_entry(info: os.stat_result, entry: LocalEntry) -> bool:
-    return stat.S_ISREG(info.st_mode) and (info.st_size, info.st_mtime_ns) == (
-        entry.size,
-        entry.mtime_ns,
+    return (
+        stat.S_ISREG(info.st_mode)
+        and (info.st_size, info.st_mtime_ns) == (entry.size, entry.mtime_ns)
+        and (entry.identity is None or entry.identity == (info.st_ino, info.st_ctime_ns))
     )
 
 
@@ -120,7 +125,7 @@ class LocalHasher:
         key = (entry.rel, entry.size, entry.mtime_ns)
         try:
             if not force:
-                cached = self._index.get_hash(*key)
+                cached = self._index.get_hash(*key, identity=entry.identity)
                 if cached is not None:
                     return cached
 
@@ -146,7 +151,7 @@ class LocalHasher:
                 after = path.lstat()
                 if not os.path.samestat(opened, after) or not _matches_entry(after, entry):
                     return None
-            self._index.put_hash(*key, digest)
+            self._index.put_hash(*key, digest, identity=entry.identity)
         except (FileChanged, OSError):
             return None
         return digest

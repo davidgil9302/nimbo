@@ -41,6 +41,7 @@ from .model import (
     About,
     AuditReport,
     BrakeDecision,
+    FileVersion,
     FolderStat,
     Op,
     OpKind,
@@ -472,9 +473,17 @@ class Engine:
             index.load_tree(cfg.target.folder_id),
             matcher,
             lambda entry: hasher.md5(entry, force=deep),
-            PlannerOptions(cfg.active_folders, root_uuid, deep, tuple(scanned.protected)),
+            PlannerOptions(
+                cfg.active_folders,
+                root_uuid,
+                deep=force_deep,
+                protected=tuple(scanned.protected),
+                periodic_deep=deep,
+            ),
             verify_same_metadata=True,
             mapped_id=mapped_id,
+            file_versions=index.file_versions(),
+            cached_hash_of=hasher.md5,
         )
 
         def update_digest(op: Op) -> str:
@@ -486,6 +495,8 @@ class Engine:
 
         brake = evaluate_brakes(plan, cfg.safety, update_digest=update_digest)
         _check_stop(stop)
+        if not plan.errors:
+            index.put_file_versions(plan.file_versions)
         return _Prepared(root_uuid, about, indexer, scanned, plan, brake, deep)
 
     def _deep_due(self) -> bool:
@@ -827,7 +838,9 @@ class Engine:
                         # Pin the directory used for exclusive download staging and publish.
                         dest = Path(f"/proc/self/fd/{parent_fd}") / name
                         try:
-                            deps.downloader.download(item, dest, on_bytes=check_download_stop)
+                            info = deps.downloader.download(
+                                item, dest, on_bytes=check_download_stop
+                            )
                         except FileExistsError:
                             if not os.path.lexists(dest):
                                 raise
@@ -835,6 +848,12 @@ class Engine:
                         except Md5Mismatch as exc:
                             raise NimboError(code="changed_since_backup") from exc
                         else:
+                            assert item.md5 is not None
+                            identity = (info.st_ino, info.st_ctime_ns)
+                            deps.index.put_hash(
+                                rel, info.st_size, info.st_mtime_ns, item.md5, identity=identity
+                            )
+                            deps.index.put_file_versions({item.id: FileVersion(identity, item.md5)})
                             summary.restored_files += 1
                 if item.is_folder:
                     children = sorted(
@@ -923,19 +942,26 @@ class Engine:
             duplicates=sorted(rel for rel, items in remote.items() if len(items) > 1),
             scan_problems=result.problems,
         )
+        versions: dict[str, FileVersion] = {}
         for rel, entry in sorted(local.items()):
             _check_stop(stop)
             digest = None if entry.is_dir else hasher.md5(entry, force=True)
             items = remote.get(rel, ())
             if not items:
                 report.missing_remote.append(rel)
-            elif not any(
-                item.is_folder == entry.is_dir
-                and (
-                    entry.is_dir
-                    or (digest is not None and (entry.size, digest) == (item.size, item.md5))
-                )
-                for item in items
-            ):
-                report.mismatched.append(rel)
+            else:
+                matching = [
+                    item
+                    for item in items
+                    if item.is_folder == entry.is_dir
+                    and (
+                        entry.is_dir
+                        or (digest is not None and (entry.size, digest) == (item.size, item.md5))
+                    )
+                ]
+                if not matching:
+                    report.mismatched.append(rel)
+                if (identity := entry.identity) is not None:
+                    versions.update((item.id, FileVersion(identity, digest)) for item in matching)
+        deps.index.put_file_versions(versions)
         return report

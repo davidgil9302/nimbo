@@ -98,6 +98,9 @@ def is_under(rel: str, ancestor: str) -> bool:
 
 
 # --------------------------------------------------------------------------- local side
+FileIdentity = tuple[int, int]  # st_ino, st_ctime_ns
+
+
 @dataclass(frozen=True, slots=True)
 class LocalEntry:
     rel: str  # NFC rel path ("DOC/a.txt")
@@ -105,11 +108,27 @@ class LocalEntry:
     size: int  # bytes; 0 for directories
     mtime_ns: int  # st_mtime_ns
     disk: str | None = None  # exact on-disk rel path when it differs from ``rel`` (non-NFC names)
+    ino: int | None = None
+    ctime_ns: int | None = None
+
+    @property
+    def identity(self) -> FileIdentity | None:
+        if self.ino is None or self.ctime_ns is None:
+            return None
+        return self.ino, self.ctime_ns
 
     @property
     def disk_rel(self) -> str:
         """Relative path to open on disk (``rel`` unless the real name is not NFC)."""
         return self.rel if self.disk is None else self.disk
+
+
+@dataclass(frozen=True, slots=True)
+class FileVersion:
+    """Local identity and the corresponding Drive checksum."""
+
+    identity: FileIdentity
+    md5: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +303,7 @@ class Op:
     disk_rel: str | None = None  # UPLOAD/UPDATE: on-disk rel path when it differs from ``rel``
     db_id: int | None = None  # row id once persisted
     trash_ids_digest: str | None = None  # folder TRASH: digest of all covered Drive IDs
+    identity: FileIdentity | None = None  # scanned version for this run's file writes
 
     @property
     def phase(self) -> Phase:
@@ -340,6 +360,7 @@ class Plan:
     # rel -> id of every remote folder that exists before execution, *after* the planned
     # folder moves are applied virtually ("" -> target root id). Used to resolve parent ids.
     folder_ids: dict[str, str] = field(default_factory=dict)
+    file_versions: dict[str, FileVersion] = field(default_factory=dict)  # Drive ID -> local version
 
     @property
     def is_empty(self) -> bool:

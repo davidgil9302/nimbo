@@ -1,7 +1,7 @@
 """Focused examples for planning, deletion accounting, and lazy hashing."""
 
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 
 import pytest
@@ -10,6 +10,7 @@ from nimbo.core.filters import Matcher
 from nimbo.core.model import (
     FOLDER_MIME,
     OWNER_PROPERTY,
+    FileVersion,
     LocalEntry,
     OpKind,
     Plan,
@@ -70,6 +71,8 @@ def _plan(
     hash_of: Callable[[LocalEntry], str | None] = lambda entry: "same",
     top: bool = True,
     mapped_id: Callable[[str, set[str]], str | None] = lambda _rel, _ids: None,
+    file_versions: Mapping[str, FileVersion | None] | None = None,
+    verify_same_metadata: bool = False,
 ) -> Plan:
     entries = (LOCAL_TOP, *local)
     files = (TOP, *remote) if top else remote
@@ -79,7 +82,9 @@ def _plan(
         Matcher(patterns),
         hash_of,
         PlannerOptions((FOLDER,), OWNER, deep=deep, protected=protected),
+        verify_same_metadata=verify_same_metadata,
         mapped_id=mapped_id,
+        file_versions=file_versions,
     )
 
 
@@ -102,6 +107,58 @@ def test_empty_remote_creates_everything_in_order():
 def test_identical_trees_produce_no_ops():
     plan = _plan([_entry("a")], [_remote("a", "a")])
     assert plan.is_empty
+
+
+@pytest.mark.parametrize(
+    ("known", "digest", "reads", "update", "store"),
+    [
+        (FileVersion((12, 34), "same"), "same", 0, False, False),
+        (FileVersion((11, 34), "same"), "new", 1, True, False),
+        (FileVersion((12, 33), "same"), "same", 1, False, True),
+        (None, "same", 1, False, True),
+        (None, "new", 1, True, False),
+        (None, None, 1, True, False),
+    ],
+    ids=[
+        "unchanged",
+        "replaced",
+        "same-bytes",
+        "no-identity-equal-digest",
+        "no-identity-different-digest",
+        "no-identity-missing-digest",
+    ],
+)
+def test_matching_size_and_time_uses_identity(known, digest, reads, update, store):
+    entry = replace(_entry("a"), ino=12, ctime_ns=34)
+    calls = []
+
+    def hash_of(local):
+        calls.append(local)
+        return digest
+
+    plan = _plan(
+        [entry],
+        [_remote("a", "a")],
+        hash_of=hash_of,
+        file_versions={} if known is None else {"a": known},
+        verify_same_metadata=True,
+    )
+
+    assert calls == [entry] * reads
+    assert _ops(plan) == ([(OpKind.UPDATE, entry.rel, "a")] if update else [])
+    assert plan.file_versions == ({"a": FileVersion((12, 34), "same")} if store else {})
+
+
+def test_matching_metadata_alone_does_not_record_identity():
+    entry = replace(_entry("a"), ino=12, ctime_ns=34)
+
+    def unexpected_hash(_entry):
+        pytest.fail("the caller disabled verification of matching metadata")
+
+    plan = _plan([entry], [_remote("a", "a")], hash_of=unexpected_hash, file_versions={})
+
+    assert plan.is_empty
+    assert plan.file_versions == {}
 
 
 def test_unmanaged_identical_file_is_adopted():

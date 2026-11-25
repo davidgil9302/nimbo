@@ -112,7 +112,13 @@ def _scan_directory(
                     result.excluded += 1
                 else:
                     result.entries[rel] = LocalEntry(
-                        rel, False, info.st_size, info.st_mtime_ns, disk=disk
+                        rel,
+                        False,
+                        info.st_size,
+                        info.st_mtime_ns,
+                        disk=disk,
+                        ino=info.st_ino,
+                        ctime_ns=info.st_ctime_ns,
                     )
             elif stat.S_ISLNK(mode):
                 result.problems.append(ScanProblem("symlink", rel))

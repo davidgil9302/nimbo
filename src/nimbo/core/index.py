@@ -14,10 +14,20 @@ from threading import RLock
 from typing import cast
 
 from nimbo.core.errors import NimboError
-from nimbo.core.model import FolderStat, Op, OpKind, OpState, RemoteFile, RunSummary, utc_now_iso
+from nimbo.core.model import (
+    FileIdentity,
+    FileVersion,
+    FolderStat,
+    Op,
+    OpKind,
+    OpState,
+    RemoteFile,
+    RunSummary,
+    utc_now_iso,
+)
 from nimbo.core.tree import RemoteTree
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 META_ROOT_UUID = "root_uuid"
 META_TARGET_ID = "target_root_id"
 # Metadata key for the Drive changes cursor.
@@ -95,6 +105,14 @@ _MIGRATIONS = {
         "ALTER TABLE trash_file ADD COLUMN is_folder INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE trash_file ADD COLUMN backup_size INTEGER",
         "ALTER TABLE trash_file ADD COLUMN backup_md5 TEXT",
+    ),
+    6: (
+        # Linux inode numbers can exceed SQLite's signed integer range.
+        "ALTER TABLE local_hash ADD COLUMN ino TEXT",
+        "ALTER TABLE local_hash ADD COLUMN ctime_ns INTEGER",
+        """
+        CREATE TABLE file_version (file_id TEXT PRIMARY KEY, ino TEXT, ctime_ns INTEGER, md5 TEXT)
+        """,
     ),
 }
 
@@ -414,27 +432,85 @@ class Index:
             )
             return next((row[0] for row in rows if row[0] in candidates), None)
 
-    def get_hash(self, rel: str, size: int, mtime_ns: int) -> str | None:
-        """Return a cached hash only if its path, size, and mtime all match."""
+    def file_versions(self) -> dict[str, FileVersion | None]:
+        """Return versions for indexed Drive file IDs, including unconfirmed writes."""
         with self._transaction():
-            row = self._execute(
-                "SELECT md5 FROM local_hash WHERE rel = ? AND size = ? AND mtime_ns = ?",
-                (rel, size, mtime_ns),
-            ).fetchone()
+            return {
+                row["file_id"]: (
+                    None
+                    if row["ino"] is None
+                    else FileVersion((int(row["ino"]), row["ctime_ns"]), row["md5"])
+                )
+                for row in self._execute(
+                    "SELECT file_id, ino, ctime_ns, file_version.md5 "
+                    "FROM file_version JOIN remote ON remote.id = file_version.file_id"
+                )
+            }
+
+    def put_file_versions(self, versions: Mapping[str, FileVersion]) -> None:
+        """Record local versions without changing the undo backup records."""
+        if versions:
+            with self._transaction(write=True):
+                self._put_file_versions(versions)
+
+    def _put_file_versions(self, versions: Mapping[str, FileVersion]) -> None:
+        self._executemany(
+            "INSERT INTO file_version (file_id, ino, ctime_ns, md5) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(file_id) DO UPDATE SET ino=excluded.ino, "
+            "ctime_ns=excluded.ctime_ns, md5=excluded.md5",
+            (
+                (file_id, str(version.identity[0]), version.identity[1], version.md5)
+                for file_id, version in versions.items()
+            ),
+        )
+
+    def get_hash(
+        self, rel: str, size: int, mtime_ns: int, *, identity: FileIdentity | None = None
+    ) -> str | None:
+        """Return a matching hash and bind a legacy row to its first observed identity."""
+        ino, ctime_ns = (str(identity[0]), identity[1]) if identity is not None else (None, None)
+        # The cache keeps one row per path. A row with an identity must match exactly.
+        query = (
+            "SELECT md5, ino FROM local_hash WHERE rel = ? AND size = ? AND mtime_ns = ? "
+            "AND ((ino IS ? AND ctime_ns IS ?) OR (ino IS NULL AND ctime_ns IS NULL))"
+        )
+        parameters = (rel, size, mtime_ns, ino, ctime_ns)
+        with self._transaction():
+            row = self._execute(query, parameters).fetchone()
+            if row is None:
+                return None
+            if identity is None or row["ino"] is not None or self._readonly:
+                return cast(str, row["md5"])
+
+        with self._transaction(write=True):
+            # A second lookup sees any cache replacement between the two transactions.
+            self._execute(
+                "UPDATE local_hash SET ino = ?, ctime_ns = ? "
+                "WHERE rel = ? AND size = ? AND mtime_ns = ? "
+                "AND ino IS NULL AND ctime_ns IS NULL",
+                (ino, ctime_ns, rel, size, mtime_ns),
+            )
+            row = self._execute(query, parameters).fetchone()
             return None if row is None else cast(str, row["md5"])
 
-    def put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
+    def put_hash(
+        self, rel: str, size: int, mtime_ns: int, md5: str, *, identity: FileIdentity | None = None
+    ) -> None:
         """Store the latest cached hash and file metadata for ``rel``."""
         with self._transaction(write=True):
-            self._put_hash(rel, size, mtime_ns, md5)
+            self._put_hash(rel, size, mtime_ns, md5, identity)
 
-    def _put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
+    def _put_hash(
+        self, rel: str, size: int, mtime_ns: int, md5: str, identity: FileIdentity | None
+    ) -> None:
+        ino, ctime_ns = (str(identity[0]), identity[1]) if identity is not None else (None, None)
         self._execute(
-            "INSERT INTO local_hash (rel, size, mtime_ns, md5, hashed_at) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO local_hash (rel, size, mtime_ns, md5, hashed_at, ino, ctime_ns) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(rel) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns, "
-            "md5=excluded.md5, hashed_at=excluded.hashed_at",
-            (rel, size, mtime_ns, md5, utc_now_iso()),
+            "md5=excluded.md5, hashed_at=excluded.hashed_at, ino=excluded.ino, "
+            "ctime_ns=excluded.ctime_ns",
+            (rel, size, mtime_ns, md5, utc_now_iso(), ino, ctime_ns),
         )
 
     def prune_hashes(self, keep: Collection[str]) -> int:
@@ -550,6 +626,18 @@ class Index:
         """Mark a persisted operation in flight, clear its error, and count the attempt."""
         with self._transaction(write=True):
             self._update_op(op, OpState.INFLIGHT, increment_attempts=True)
+            if op.identity is not None and op.file_id is not None:
+                # A Drive write can commit before we record its verified version.
+                # Check its bytes on recovery if there's no earlier version to use.
+                self._execute(
+                    "INSERT INTO file_version (file_id) VALUES (?) ON CONFLICT DO NOTHING",
+                    (op.file_id,),
+                )
+                # An unbound legacy hash could hide a source change after the write.
+                self._execute(
+                    "DELETE FROM local_hash WHERE rel = ? AND ino IS NULL AND ctime_ns IS NULL",
+                    (op.rel,),
+                )
 
     def record_trash_files(
         self, op: Op, files: Sequence[TrashFile], *, guarded_ids: Collection[str] | None = None
@@ -618,6 +706,7 @@ class Index:
         trash_additions: Sequence[TrashFile] = (),
         local_md5: str | None = None,
         backed_up: tuple[str, int, str] | None = None,
+        file_version: FileVersion | None = None,
     ) -> None:
         """Mark an operation done with its mirror, trash log and verified digest changes.
 
@@ -629,7 +718,11 @@ class Index:
             self._upsert_remote(upsert)
             self._delete_remote(remove_subtrees)
             if local_md5 is not None:
-                self._put_hash(op.rel, op.size, op.mtime_ns, local_md5)
+                self._put_hash(op.rel, op.size, op.mtime_ns, local_md5, op.identity)
+            if file_version is not None:
+                if op.file_id is None:
+                    raise ValueError("A Drive file ID is required for the local version")
+                self._put_file_versions({op.file_id: file_version})
             if backed_up is not None:
                 self._execute(
                     "INSERT INTO backup_file (file_id, size, md5) VALUES (?, ?, ?) "

@@ -22,6 +22,7 @@ from nimbo.core.drive import DriveClient
 from nimbo.core.engine import Engine, EngineDeps
 from nimbo.core.errors import AuthError, FileChanged, LockedError
 from nimbo.core.executor import ExecReport
+from nimbo.core.hasher import LocalHasher
 from nimbo.core.index import (
     META_ACCOUNT,
     META_CHANGES_RELIABLE,
@@ -31,12 +32,14 @@ from nimbo.core.index import (
     META_QUOTA_LIMIT,
     META_ROOT_UUID,
     META_TARGET_ID,
+    SCHEMA_VERSION,
     Index,
 )
 from nimbo.core.lock import RunLock
 from nimbo.core.model import (
     OWNER_PROPERTY,
     SENTINEL_NAME,
+    FileVersion,
     Op,
     OpKind,
     OpState,
@@ -168,7 +171,9 @@ def mirror(
 ) -> Iterator[_Harness]:
     clock = _Clock()
     monkeypatch.setattr("nimbo.core.index.utc_now_iso", lambda: clock().isoformat())
-    fake = FakeDrive(clock=lambda: clock.now.timestamp(), **getattr(request, "param", {}))
+    options = dict(getattr(request, "param", {}))
+    index_schema = options.pop("index_schema", SCHEMA_VERSION)
+    fake = FakeDrive(clock=lambda: clock.now.timestamp(), **options)
     tokens = _Tokens(fake)
     paths = Paths(tmp_path / "config", tmp_path / "state")
     paths.ensure()
@@ -192,7 +197,9 @@ def mirror(
             RetryPolicy(max_attempts=3, base_delay=0),
             sleep=lambda _: None,
         )
-        index = Index(paths.db_file)
+        with monkeypatch.context() as previous:
+            previous.setattr("nimbo.core.index.SCHEMA_VERSION", index_schema)
+            index = Index(paths.db_file)
         deps = EngineDeps(
             cfg,
             paths,
@@ -230,7 +237,20 @@ def test_first_run_uploads_everything(mirror: _Harness) -> None:
     assert mirror.index.get_meta(META_CHANGES_TOKEN)
 
 
-def test_second_run_makes_no_writes(mirror: _Harness) -> None:
+@pytest.fixture
+def hasher_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    reads: list[int] = []
+    count_read = LocalHasher._count_read
+
+    def count(hasher: LocalHasher, size: int) -> None:
+        reads.append(size)
+        count_read(hasher, size)
+
+    monkeypatch.setattr(LocalHasher, "_count_read", count)
+    return reads
+
+
+def test_second_run_makes_no_writes(mirror: _Harness, hasher_reads: list[int]) -> None:
     mirror.put("Docs/sub/a")
     mirror.run()
     writes = mirror.fake.write_count()
@@ -238,7 +258,157 @@ def test_second_run_makes_no_writes(mirror: _Harness) -> None:
     assert mirror.run().uploaded == 0
 
     assert mirror.fake.write_count() == writes
+    assert hasher_reads == []
     mirror.assert_mirror()
+
+
+@pytest.mark.parametrize("replace_file", [True, False], ids=["rename", "in-place"])
+@pytest.mark.parametrize("new_bytes", [b"new", b"old"], ids=["different-content", "equal-content"])
+def test_detects_identity_change_with_preserved_mtime(
+    mirror: _Harness, hasher_reads: list[int], replace_file: bool, new_bytes: bytes
+) -> None:
+    path = mirror.put("Docs/report", b"old")
+    mirror.run()
+    docs = mirror.fake.find(mirror.target, "Docs")[0].id
+    [item] = mirror.fake.find(docs, path.name)
+    original = path.stat()
+    writes = mirror.fake.write_count()
+
+    if replace_file:
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(new_bytes)
+        os.replace(replacement, path)
+    else:
+        path.write_bytes(new_bytes)
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    current = path.stat()
+    assert (current.st_size, current.st_mtime_ns) == (original.st_size, original.st_mtime_ns)
+    assert (current.st_ino != original.st_ino) == replace_file
+    assert current.st_ctime_ns != original.st_ctime_ns or replace_file
+
+    changed = new_bytes != b"old"
+    assert mirror.run().updated == int(changed)
+    assert mirror.fake.file(item.id).content == new_bytes
+    assert mirror.fake.write_count() == writes + int(changed)
+    assert hasher_reads == [len(new_bytes)]
+    assert mirror.index.file_versions()[item.id] == FileVersion(
+        (current.st_ino, current.st_ctime_ns), md5(new_bytes, usedforsecurity=False).hexdigest()
+    )
+
+    assert mirror.run().updated == 0
+    assert mirror.fake.write_count() == writes + int(changed)
+    assert hasher_reads == [len(new_bytes)]
+
+
+@pytest.mark.parametrize("mirror", [{"index_schema": 5}], indirect=True)
+@pytest.mark.parametrize(
+    ("remote_bytes", "deep_due"),
+    [(b"keep", False), (b"edit", False), (b"keep", True)],
+    ids=["unchanged", "same-metadata-drive-edit", "periodic-deep-due"],
+)
+def test_first_runs_after_migration_compare_cached_digests(
+    mirror: _Harness, hasher_reads: list[int], remote_bytes: bytes, deep_due: bool
+) -> None:
+    props = {OWNER_PROPERTY: _OWNER}
+    folder = mirror.fake.add_folder("Docs", mirror.target, properties=props)
+    file_ids = {}
+    expected_versions = {}
+    for name, content in (("keep.txt", b"keep"), ("report.txt", b"report")):
+        rel = f"Docs/{name}"
+        info = mirror.put(rel, content).stat()
+        file_id = mirror.fake.add_file(
+            name, folder, content, modified_ms=drive_ms(info.st_mtime_ns), properties=props
+        )
+        digest = md5(content, usedforsecurity=False).hexdigest()
+        mirror.index._connection.execute(
+            "INSERT INTO backup_file VALUES (?, ?, ?)", (file_id, info.st_size, digest)
+        )
+        mirror.index._connection.execute(
+            "INSERT INTO local_hash VALUES (?, ?, ?, ?, ?)",
+            (rel, info.st_size, info.st_mtime_ns, digest, _DAY.isoformat()),
+        )
+        file_ids[name] = file_id
+        expected_versions[file_id] = FileVersion((info.st_ino, info.st_ctime_ns), digest)
+
+    mirror.index.upsert_remote(mirror.deps.drive.list_children([folder]))
+    mirror.index.set_meta(META_TARGET_ID, mirror.target)
+    if not deep_due:
+        mirror.index.set_meta(META_LAST_DEEP, _DAY.isoformat())
+    edited = remote_bytes != b"keep"
+    if edited:
+        file_id = file_ids["keep.txt"]
+        mirror.fake.set_content(file_id, remote_bytes, keep_modified=True)
+        item = mirror.fake.file(file_id)
+        assert (item.size, item.modified_ms) == (4, drive_ms(_MTIME))
+        assert item.md5 != expected_versions[file_id].md5
+
+    mirror.reopen()
+    assert mirror.index.file_versions() == {}
+    writes = mirror.fake.write_count()
+
+    assert mirror.run().updated == int(edited)
+    assert mirror.fake.file(file_ids["keep.txt"]).content == b"keep"
+    assert mirror.fake.write_count() == writes + int(edited)
+    assert hasher_reads == []
+    assert mirror.index.file_versions() == expected_versions
+
+    assert mirror.run().updated == 0
+    assert mirror.fake.write_count() == writes + int(edited)
+    assert hasher_reads == []
+
+    mirror.put("Docs/report.txt", b"edited")
+    assert mirror.run().updated == 1
+    assert mirror.fake.file(file_ids["report.txt"]).content == b"edited"
+    assert hasher_reads == [6]
+
+
+@pytest.mark.parametrize("legacy_hash", [False, True], ids=["uncached", "legacy-hash"])
+def test_rechecks_interrupted_new_upload_before_baselining(
+    mirror: _Harness, hasher_reads: list[int], legacy_hash: bool
+) -> None:
+    mirror.run()
+    path = mirror.put("Docs/report", b"old")
+    if legacy_hash:
+        mirror.index.put_hash(
+            "Docs/report", 3, _MTIME, md5(b"old", usedforsecurity=False).hexdigest()
+        )
+    mirror.fake.faults.add(Fault(FaultPlan.is_write, "crash_after"))
+    with pytest.raises(SimulatedCrash):
+        mirror.run()
+
+    mirror.put("Docs/report", b"new")
+    mirror.reopen()
+
+    assert mirror.run().updated == 1
+    assert path.read_bytes() == b"new"
+    assert hasher_reads == [3]
+    mirror.assert_mirror()
+
+
+def test_adopt_then_touch_records_each_confirmed_identity(
+    mirror: _Harness, hasher_reads: list[int]
+) -> None:
+    path = mirror.root / "Docs/keep.txt"
+    folder = mirror.fake.add_folder("Docs", mirror.target)
+    file_id = mirror.fake.add_file("keep.txt", folder, b"keep", modified_ms=drive_ms(_MTIME))
+    first = path.stat()
+
+    assert mirror.run().adopted == 1
+    digest = md5(b"keep", usedforsecurity=False).hexdigest()
+    assert mirror.index.file_versions()[file_id] == FileVersion(
+        (first.st_ino, first.st_ctime_ns), digest
+    )
+
+    os.utime(path, ns=(first.st_atime_ns, first.st_mtime_ns + 1_000_000))
+    second = path.stat()
+    assert mirror.run().touched == 1
+    assert mirror.index.file_versions()[file_id] == FileVersion(
+        (second.st_ino, second.st_ctime_ns), digest
+    )
+    writes = mirror.fake.write_count()
+    assert hasher_reads == [4, 4]
+    mirror.run()
+    assert hasher_reads == [4, 4] and mirror.fake.write_count() == writes
 
 
 def test_edit_rename_delete_cycle(mirror: _Harness) -> None:
@@ -568,7 +738,7 @@ def test_partial_when_file_in_use(mirror: _Harness, monkeypatch: pytest.MonkeyPa
     assert stat.last_ok is None and path.exists()
 
 
-def test_undo_restores_local_files_and_untrashes(mirror: _Harness) -> None:
+def test_undo_restores_local_files_and_untrashes(mirror: _Harness, hasher_reads: list[int]) -> None:
     single = mirror.put("Docs/single", b"single")
     nested = mirror.put("Docs/sub/nested", b"nested")
     mirror.run()
@@ -588,6 +758,20 @@ def test_undo_restores_local_files_and_untrashes(mirror: _Harness) -> None:
     assert nested.stat().st_mtime_ns == drive_ms(_MTIME) * 1_000_000
     assert nested.parent.stat().st_mtime_ns == folder_mtime * 1_000_000
     mirror.assert_mirror()
+    versions = mirror.index.file_versions()
+    tree = mirror.index.load_tree(mirror.target).by_rel()
+    for path in (single, nested):
+        info = path.stat()
+        rel = path.relative_to(mirror.root).as_posix()
+        [item] = tree[rel]
+        identity = (info.st_ino, info.st_ctime_ns)
+        assert versions[item.id] == FileVersion(identity, item.md5)
+        assert mirror.index.get_hash(rel, info.st_size, info.st_mtime_ns, identity=identity) == (
+            item.md5
+        )
+    writes = mirror.fake.write_count()
+    mirror.run()
+    assert hasher_reads == [] and mirror.fake.write_count() == writes
 
 
 @pytest.mark.parametrize(
@@ -661,8 +845,14 @@ def test_verify_detects_silent_remote_corruption_and_repairs(mirror: _Harness) -
     mirror.run()
     docs = mirror.fake.find(mirror.target, "Docs")[0].id
     item = mirror.fake.find(docs, "keep.txt")[0]
-    key = ("Docs/keep.txt", 4, _MTIME)
-    mirror.index.put_hash(*key, md5(b"oops", usedforsecurity=False).hexdigest())
+    info = (mirror.root / "Docs/keep.txt").stat()
+    mirror.index.put_hash(
+        "Docs/keep.txt",
+        4,
+        _MTIME,
+        md5(b"oops", usedforsecurity=False).hexdigest(),
+        identity=(info.st_ino, info.st_ctime_ns),
+    )
     mirror.fake.set_content(item.id, b"oops", keep_modified=True)
 
     audit = mirror.engine.verify(repair=True)

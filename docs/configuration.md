@@ -105,10 +105,18 @@ renames and timestamp changes are excluded. Either brake pauses the backup for
 review in the dashboard or with `backup now --confirm`. An approval is valid for
 the reviewed changes for 24 hours and is consumed when a paused plan is checked.
 
-Between deep comparisons, routine backups can reuse cached hashes for files
-whose size and modification time match. Use `backup verificar` to rehash file
-contents after edits that preserve both values. `backup verificar --reparar`
-can apply the resulting changes with the usual safety checks.
+Routine backups compare inode numbers and inode change times (`ctime`) as well
+as file sizes and modification times. If a file's identity changes while its
+size and modification time match, nimbo compares its MD5 checksum with Drive
+and uploads only changed content. When an existing managed file has matching size
+and modification time but no stored identity, nimbo compares its MD5 with Drive.
+It reuses a cached MD5 when available and records the identity if the digests match.
+
+Filesystems with unstable inode numbers, such as FAT, exFAT and some network
+mounts, cause nimbo to re-read files after each remount. It uploads only files
+whose contents changed. Use `backup verificar` to rehash and compare the entire
+mirror with Drive. `backup verificar --reparar` can apply the resulting changes
+with the usual safety checks.
 
 ## Exclusions
 

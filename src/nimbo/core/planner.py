@@ -12,6 +12,7 @@ from typing import Protocol
 from nimbo.core.model import (
     FOREIGN_ITEM_KEPT,
     INVALID_NAME_PREFIX,
+    FileVersion,
     LocalEntry,
     Op,
     OpKind,
@@ -44,6 +45,7 @@ class PlannerOptions:
     root_uuid: str
     deep: bool = False
     protected: tuple[str, ...] = ()
+    periodic_deep: bool = False
 
 
 def _path_order(rel: str) -> tuple[int, str]:
@@ -434,7 +436,9 @@ def _file_moves(
         parent_id = _destination_parent(rel, pairs, remote.root)
         move = remote.move(file_id, rel, parent_id, [])
         move.md5 = md5
+        move.size = entry.size
         move.mtime_ns = entry.mtime_ns
+        move.identity = entry.identity
         moves.append(move)
         pairs[rel] = remote.items[file_id]
         trash.pop(file_id)
@@ -496,21 +500,24 @@ def _content_op(
     entry: LocalEntry,
     item: RemoteFile,
     check_hash: bool,
-    md5_of: Callable[[LocalEntry], str | None],
+    md5_of: Callable[[LocalEntry, bool], str | None],
     *,
     verify_same_metadata: bool,
+    known: FileVersion | None,
 ) -> Op | None:
     same_time = drive_ms(entry.mtime_ns) == item.modified_ms
     md5 = None
     if entry.size == item.size:
-        if (
-            same_time
-            and not check_hash
-            and item.owner_root is not None
-            and not verify_same_metadata
-        ):
-            return None
-        md5 = md5_of(entry)
+        matched_metadata = same_time and not check_hash and item.owner_root is not None
+        if matched_metadata:
+            if not verify_same_metadata:
+                return None
+            if known is not None and known.identity == entry.identity:
+                if known.md5 == item.md5:
+                    return None
+                md5 = known.md5
+        if md5 is None:
+            md5 = md5_of(entry, matched_metadata and known is None)
         if md5 is not None and md5 == item.md5:
             if not same_time:
                 return Op(
@@ -518,8 +525,10 @@ def _content_op(
                     entry.rel,
                     "metadata",
                     file_id=item.id,
+                    size=entry.size,
                     mtime_ns=entry.mtime_ns,
                     md5=md5,
+                    identity=entry.identity,
                 )
             if item.owner_root is None:
                 return Op(
@@ -527,8 +536,10 @@ def _content_op(
                     entry.rel,
                     "adopted",
                     file_id=item.id,
+                    size=entry.size,
                     mtime_ns=entry.mtime_ns,
                     md5=md5,
+                    identity=entry.identity,
                 )
             return None
     return Op(
@@ -540,6 +551,7 @@ def _content_op(
         mtime_ns=entry.mtime_ns,
         md5=md5,
         disk_rel=entry.disk,
+        identity=entry.identity,
     )
 
 
@@ -585,6 +597,8 @@ def make_plan(
     *,
     verify_same_metadata: bool = False,
     mapped_id: Callable[[str, set[str]], str | None] = lambda _rel, _ids: None,
+    file_versions: Mapping[str, FileVersion | None] | None = None,
+    cached_hash_of: Callable[[LocalEntry], str | None] | None = None,
 ) -> Plan:
     """Return ordered mirror operations without changing either input snapshot.
 
@@ -592,6 +606,11 @@ def make_plan(
     current bytes or return None if unavailable. Read it lazily and cache both
     results for this plan. Set `verify_same_metadata` when the callback can
     reuse stored local digests to detect remote edits that preserve metadata.
+    When given journaled file versions, compare local identities as well and
+    collect new versions for files whose digests match and need no Drive write.
+    Supply `cached_hash_of` to allow a cache lookup for unversioned managed files
+    with matching metadata during a periodic deep comparison.
+    A version entry with a None value flags a write that still needs verification.
     `mapped_id` may choose a journaled ID from the checksum-tied candidates.
     A foreign target or missing destination parent yields an error plan with no
     operations. Callback errors propagate to the caller.
@@ -616,10 +635,12 @@ def make_plan(
     remote = _Remote(tree, entries, matcher, options, plan)
 
     hashes: dict[str, str | None] = {}
+    versions = file_versions if file_versions is not None else {}
 
-    def md5_of(entry: LocalEntry) -> str | None:
+    def md5_of(entry: LocalEntry, prefer_cached: bool = False) -> str | None:
         if entry.rel not in hashes:
-            hashes[entry.rel] = hash_of(entry)
+            reader = cached_hash_of if prefer_cached and cached_hash_of is not None else hash_of
+            hashes[entry.rel] = reader(entry)
         return hashes[entry.rel]
 
     counts = Counter(
@@ -643,15 +664,29 @@ def make_plan(
             if entry.is_dir:
                 plan.folder_ids[rel] = item.id
             elif rel not in moved_files:
+                identity = entry.identity
+                known = versions.get(item.id)
+                check_version = item.id in versions and (
+                    options.periodic_deep or known is None or known.identity != identity
+                )
                 op = _content_op(
                     entry,
                     item,
-                    options.deep or rel in relocated,
+                    options.deep or rel in relocated or check_version,
                     md5_of,
                     verify_same_metadata=verify_same_metadata,
+                    known=known,
                 )
                 if op is not None:
                     contents.append(op)
+                elif (
+                    identity is not None
+                    and (digest := hashes.get(rel)) is not None
+                    and digest == item.md5
+                ):
+                    version = FileVersion(identity, digest)
+                    if file_versions is not None and known != version:
+                        plan.file_versions[item.id] = version
             continue
         if entry.is_dir:
             mkdirs.append(
@@ -669,6 +704,7 @@ def make_plan(
                     mtime_ns=entry.mtime_ns,
                     md5=hashes.get(rel),
                     disk_rel=entry.disk,
+                    identity=entry.identity,
                 )
             )
 

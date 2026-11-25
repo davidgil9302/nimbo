@@ -29,6 +29,7 @@ from nimbo.core.index import (
 )
 from nimbo.core.model import (
     FOLDER_MIME,
+    FileVersion,
     FolderStat,
     Op,
     OpKind,
@@ -107,6 +108,49 @@ def test_db_too_new_rejected(db_path: Path) -> None:
     with closing(sqlite3.connect(db_path)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == version
         assert connection.execute("SELECT name FROM sqlite_master").fetchall() == [("future",)]
+
+
+def test_migrate_v5_retains_backups_and_hashes_without_identity(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    item = _file("item", "root")
+    with monkeypatch.context() as previous:
+        previous.setattr("nimbo.core.index.SCHEMA_VERSION", 5)
+        with closing(Index(db_path)) as legacy:
+            legacy.upsert_remote([item])
+            legacy._connection.execute(
+                "INSERT INTO backup_file VALUES (?, ?, ?)", (item.id, 10, "hash")
+            )
+            legacy._connection.execute(
+                "INSERT INTO local_hash VALUES (?, ?, ?, ?, ?)", ("item", 10, 20, "hash", STARTED)
+            )
+
+    with closing(Index(db_path)) as index:
+        assert index._connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert index.get_remote(item.id) == item
+        assert index.file_versions() == {}
+        backup = index._connection.execute("SELECT * FROM backup_file").fetchone()
+        assert tuple(backup) == (item.id, 10, "hash")
+        assert index.get_hash("item", 10, 20) == "hash"
+        assert index.get_hash("item", 10, 20, identity=(12, 34)) == "hash"
+        assert index.get_hash("item", 10, 20, identity=(12, 34)) == "hash"
+        assert index.get_hash("item", 10, 20, identity=(13, 34)) is None
+        assert index.get_hash("item", 10, 20, identity=(12, 35)) is None
+
+
+def test_hash_and_file_version_support_unsigned_inodes(db: Index) -> None:
+    item = _file("item", "root")
+    db.upsert_remote([item])
+    ino = (1 << 64) - 1
+    version = FileVersion((ino, 34), "hash")
+
+    db.put_file_versions({item.id: version})
+    db.put_hash("item", 10, 20, "hash", identity=version.identity)
+
+    assert db.file_versions() == {item.id: version}
+    assert db.get_hash("item", 10, 20, identity=(ino, 34)) == "hash"
+    assert db.get_hash("item", 10, 20, identity=(ino - 1, 34)) is None
+    assert db.get_hash("item", 10, 20, identity=(ino, 35)) is None
 
 
 def test_migration_failure_rolls_back_schema_and_version(db_path: Path) -> None:

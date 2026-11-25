@@ -13,20 +13,24 @@ import pytest
 
 from nimbo.core.errors import Stopped
 from nimbo.core.hasher import LocalHasher, md5_file
-from nimbo.core.model import LocalEntry
+from nimbo.core.model import FileIdentity, LocalEntry
 
 
 class _Cache:
     def __init__(self) -> None:
-        self.hashes: dict[tuple[str, int, int], str] = {}
+        self.hashes: dict[tuple[str, int, int, FileIdentity | None], str] = {}
 
-    def get_hash(self, rel: str, size: int, mtime_ns: int) -> str | None:
+    def get_hash(
+        self, rel: str, size: int, mtime_ns: int, *, identity: FileIdentity | None = None
+    ) -> str | None:
         """Look up a digest by path and observed file metadata."""
-        return self.hashes.get((rel, size, mtime_ns))
+        return self.hashes.get((rel, size, mtime_ns, identity))
 
-    def put_hash(self, rel: str, size: int, mtime_ns: int, md5: str) -> None:
+    def put_hash(
+        self, rel: str, size: int, mtime_ns: int, md5: str, *, identity: FileIdentity | None = None
+    ) -> None:
         """Store a digest under its path and observed metadata."""
-        self.hashes[rel, size, mtime_ns] = md5
+        self.hashes[rel, size, mtime_ns, identity] = md5
 
 
 def _entry(path: Path, root: Path, *, rel: str | None = None) -> LocalEntry:
@@ -39,6 +43,8 @@ def _entry(path: Path, root: Path, *, rel: str | None = None) -> LocalEntry:
         stat_result.st_size,
         stat_result.st_mtime_ns,
         disk=disk if disk != canonical else None,
+        ino=stat_result.st_ino,
+        ctime_ns=stat_result.st_ctime_ns,
     )
 
 
@@ -100,19 +106,38 @@ def test_cache_miss_on_change(tmp_path: Path, change: str) -> None:
 
 
 def test_force_rehash(tmp_path: Path) -> None:
-    """Bypass and replace a cached digest for content changed with identical metadata."""
+    """Bypass and replace a cached digest for the same scanned identity."""
     path = tmp_path / "file"
     path.write_bytes(b"old")
-    hasher = LocalHasher(tmp_path, _Cache())
     original = _entry(path, tmp_path)
+    cache = _Cache()
+    hasher = LocalHasher(tmp_path, cache)
+    cache.put_hash(
+        original.rel, original.size, original.mtime_ns, _digest(b"new"), identity=original.identity
+    )
+    assert hasher.md5(original) == _digest(b"new")
+    assert hasher.md5(original, force=True) == _digest(b"old")
+    assert hasher.md5(original) == _digest(b"old")
+    assert hasher.hashed_bytes == 3
+
+
+def test_cache_misses_after_replacement_with_same_size_and_mtime(tmp_path: Path) -> None:
+    """Read the new inode even when size and mtime are identical."""
+    path = tmp_path / "file"
+    path.write_bytes(b"old")
+    original = _entry(path, tmp_path)
+    hasher = LocalHasher(tmp_path, _Cache())
     assert hasher.md5(original) == _digest(b"old")
 
-    path.write_bytes(b"new")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"new")
+    os.replace(replacement, path)
     os.utime(path, ns=(original.mtime_ns, original.mtime_ns))
-    assert _entry(path, tmp_path) == original
-    assert hasher.md5(original) == _digest(b"old")
-    assert hasher.md5(original, force=True) == _digest(b"new")
-    assert hasher.md5(original) == _digest(b"new")
+    current = _entry(path, tmp_path)
+
+    assert (current.size, current.mtime_ns) == (original.size, original.mtime_ns)
+    assert current.ino != original.ino
+    assert hasher.md5(current) == _digest(b"new")
     assert hasher.hashed_bytes == 6
 
 
@@ -178,7 +203,9 @@ def test_returns_none_if_path_is_replaced_with_same_metadata(tmp_path: Path) -> 
     hasher = LocalHasher(tmp_path, cache, should_stop=replace_path)
 
     assert hasher.md5(entry) is None
-    assert _entry(path, tmp_path) == entry
+    current = _entry(path, tmp_path)
+    assert (current.size, current.mtime_ns) == (entry.size, entry.mtime_ns)
+    assert current.ino != entry.ino
     assert hasher.hashed_bytes == 1
     assert cache.hashes == {}
 
@@ -282,7 +309,9 @@ def test_hasher_reads_disk_rel_for_nfd_file(
         patch.setattr(os, "scandir", deny_listing)
         assert LocalHasher(tmp_path, cache).md5(entry) == _digest(b"data")
 
-    assert cache.hashes == {(entry.rel, entry.size, entry.mtime_ns): _digest(b"data")}
+    assert cache.hashes == {
+        (entry.rel, entry.size, entry.mtime_ns, entry.identity): _digest(b"data")
+    }
 
 
 def test_hashes_disk_winner_when_both_spellings_exist(tmp_path: Path) -> None:

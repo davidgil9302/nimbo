@@ -38,7 +38,7 @@ def _write(root: Path, rel: str, content: bytes = b"") -> Path:
 
 
 def test_scans_nested_tree_with_sizes_and_mtimes(source_root: Path) -> None:
-    """Collect exact nanosecond mtimes and file sizes beneath a configured folder."""
+    """Collect exact times, sizes and regular-file identities beneath a configured folder."""
     data = _write(source_root, "Docs/nested/data", b"123")
     _write(source_root, "Docs/zero")
     mtime_ns = 1_700_000_000_123_456_789
@@ -53,10 +53,17 @@ def test_scans_nested_tree_with_sizes_and_mtimes(source_root: Path) -> None:
         "Docs/nested/data": (False, 3),
         "Docs/zero": (False, 0),
     }
-    assert result.entries == {
-        rel: LocalEntry(rel, is_dir, size, (source_root / rel).stat().st_mtime_ns)
-        for rel, (is_dir, size) in metadata.items()
-    }
+    assert set(result.entries) == metadata.keys()
+    for rel, (is_dir, size) in metadata.items():
+        info = (source_root / rel).stat()
+        assert result.entries[rel] == LocalEntry(
+            rel,
+            is_dir,
+            size,
+            info.st_mtime_ns,
+            ino=None if is_dir else info.st_ino,
+            ctime_ns=None if is_dir else info.st_ctime_ns,
+        )
     assert result.problems == []
     assert result.missing_folders == []
     assert result.empty_folders == []

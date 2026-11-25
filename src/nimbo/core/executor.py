@@ -36,6 +36,7 @@ from .model import (
     FILE_FIELDS,
     FOREIGN_ITEM_KEPT,
     OWNER_PROPERTY,
+    FileVersion,
     Op,
     OpKind,
     Phase,
@@ -693,6 +694,15 @@ class Executor:
                         PlanIssue(TRASH_TOOK_NEW_ITEMS, entry.rel) for entry in additions
                     )
                 else:
+                    digest = backup_md5 if op.kind in _UPLOAD else op.md5
+                    version = (
+                        FileVersion(op.identity, digest)
+                        if op.identity is not None
+                        and digest is not None
+                        and not item.trashed
+                        and (item.id, item.size, item.md5) == (file_id, op.size, digest)
+                        else None
+                    )
                     self._index.complete_op(
                         op,
                         upsert=[item],
@@ -700,6 +710,7 @@ class Executor:
                         backed_up=(item.id, item.size, backup_md5)
                         if item.size is not None and backup_md5 is not None
                         else None,
+                        file_version=version,
                     )
                 run.report.done[op.kind] += 1
                 run.report.uploaded_bytes += uploaded
@@ -1076,6 +1087,7 @@ class Executor:
             destination_rel=op.rel,
             expected_remote=run.planned.get(file_id) if update else None,
             known_type_conflict=lambda item: _planned_type_conflict(run.planned, op, item),
+            identity=op.identity,
         )
         try:
             if self._root_id is None and update:
