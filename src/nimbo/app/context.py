@@ -74,16 +74,15 @@ def new_http_client(*, loopback: bool = False) -> httpx.Client:
     )
 
 
-def secret_store(hooks: TestHooks, config_dir: Path | None = None) -> SecretStore:
+def secret_store(hooks: TestHooks, config_dir: Path) -> SecretStore:
     """Select in-memory storage in hook mode and the profile's keyring item otherwise.
 
-    The profile is the configuration directory, which defaults to the one the
-    environment selects. Callers that already hold their Paths pass its config_dir.
+    The profile is the configuration directory. It is required so that no caller can
+    fall back to another profile's keyring item by omission.
     """
     if hooks.api_base is not None:
         return MemorySecretStore()
-    directory = Paths.default().config_dir if config_dir is None else config_dir
-    return SecretServiceStore(profile=profile_id(directory))
+    return SecretServiceStore(profile=profile_id(config_dir))
 
 
 def token_provider(
